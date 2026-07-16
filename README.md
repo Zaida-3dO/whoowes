@@ -37,6 +37,22 @@ npm run build     # tsc -> dist/
 npm run smoke     # runs the worked scenario with assertions
 ```
 
+## Transports
+
+Two entry points over the same tools:
+
+| Entry | Command | Use |
+| --- | --- | --- |
+| stdio | `node dist/server.js` | One client spawns its own copy (Claude Code / Desktop). |
+| streamable-http | `node dist/http.js` | One shared process owns the ledger; many clients connect over HTTP. Serves `POST /mcp` (plus `GET /health`); `PORT` defaults to 8000. |
+
+**Only ever run one writer against a given `WHOOWES_DIR`.** The HTTP server is
+safe for concurrent clients because every tool handler does load → mutate → save
+synchronously in one tick and `save()` is atomic (tmp file + rename), so the
+process serialises all writes. Two *separate* instances on the same file (e.g.
+two stdio clones pointed at a shared folder) have no such guarantee and will
+last-writer-wins.
+
 ## Register
 
 Claude Code (user scope, works in any project):
@@ -57,6 +73,27 @@ Claude Desktop (`claude_desktop_config.json`):
   }
 }
 ```
+
+Against a shared HTTP instance instead (see below):
+
+```
+claude mcp add --scope user --transport http whoowes http://<host>:18801/mcp
+```
+
+## Shared deployment (Docker)
+
+The included `Dockerfile` builds the HTTP server. The ledger is **not** in the
+image — mount a volume at `/data` (the image sets `WHOOWES_DIR=/data`).
+
+```
+docker build -t whoowes .
+docker run -d --name whoowes-mcp -p 18801:8000 -v /srv/whoowes-data:/data whoowes
+curl http://localhost:18801/health
+```
+
+Clients then point at `http://<host>:18801/mcp` (transport `streamable-http`),
+and everyone shares the same tabs. Back up by copying `ledger.json` out of the
+mounted volume.
 
 ## Tools
 
