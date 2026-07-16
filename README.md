@@ -1,4 +1,4 @@
-# shared-tabs
+# whoowes
 
 MCP server for self-contained trip/event expense ledgers. You talk to a model
 ("we paid 200k naira for the hotel, 20% timi 80% george", "george sent me 20k",
@@ -26,8 +26,8 @@ ledger does the arithmetic with `decimal.js`. The model never computes a number.
 
 ## Storage
 
-A single JSON file at `~/.shared-tabs/ledger.json` (override with the
-`SHARED_TABS_DIR` env var). It is the event log; back it up by copying it.
+A single JSON file at `~/.whoowes/ledger.json` (override with the
+`WHOOWES_DIR` env var). It is the event log; back it up by copying it.
 
 ## Build
 
@@ -42,7 +42,7 @@ npm run smoke     # runs the worked scenario with assertions
 Claude Code (user scope, works in any project):
 
 ```
-claude mcp add --scope user shared-tabs -- node C:/Users/opsij/Documents/Coding/shared-tabs/dist/server.js
+claude mcp add --scope user whoowes -- node C:/Users/opsij/Documents/Coding/whoowes/dist/server.js
 ```
 
 Claude Desktop (`claude_desktop_config.json`):
@@ -50,9 +50,9 @@ Claude Desktop (`claude_desktop_config.json`):
 ```json
 {
   "mcpServers": {
-    "shared-tabs": {
+    "whoowes": {
       "command": "node",
-      "args": ["C:/Users/opsij/Documents/Coding/shared-tabs/dist/server.js"]
+      "args": ["C:/Users/opsij/Documents/Coding/whoowes/dist/server.js"]
     }
   }
 }

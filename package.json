@@ -1,5 +1,5 @@
 {
-  "name": "shared-tabs",
+  "name": "whoowes",
   "version": "0.1.0",
   "description": "MCP server for trip/event expense ledgers: shared expenses, settlements, multi-currency with retroactive weighted-average rates",
   "type": "module",

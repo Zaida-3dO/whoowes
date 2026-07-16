@@ -3,7 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Ledger, LedgerError, Tab } from "./types.js";
 
-const DATA_DIR = process.env.SHARED_TABS_DIR ?? path.join(os.homedir(), ".shared-tabs");
+const DATA_DIR = process.env.WHOOWES_DIR ?? path.join(os.homedir(), ".whoowes");
 const FILE = path.join(DATA_DIR, "ledger.json");
 
 export function load(): Ledger {

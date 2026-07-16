@@ -7,7 +7,7 @@ import { balancesReport, foldTab, personView, shareAmount } from "./fold.js";
 import { ensureOpen, ensureParticipant, findTab, ledgerFilePath, load, normalizeName, save } from "./store.js";
 import { LedgerError, Tab, TabEvent } from "./types.js";
 
-const server = new McpServer({ name: "shared-tabs", version: "0.1.0" });
+const server = new McpServer({ name: "whoowes", version: "0.1.0" });
 
 const money = z
   .union([z.string(), z.number()])
@@ -378,4 +378,4 @@ server.registerTool(
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-console.error(`shared-tabs MCP server running (ledger: ${ledgerFilePath()})`);
+console.error(`whoowes MCP server running (ledger: ${ledgerFilePath()})`);
