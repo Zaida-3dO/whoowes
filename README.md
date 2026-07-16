@@ -109,7 +109,14 @@ mounted volume.
 | `get_person` | One person's obligations, payments, and settlements |
 | `list_tabs` | All tabs |
 | `set_tab_status` | Close or reopen a tab |
+| `set_base_currency` | Rebase a tab; everything revalues retroactively |
+| `delete_tab` | Permanently delete a tab and its log (needs `confirm: true`) |
 | `undo_last_event` | Remove the most recent event |
+
+**Rebasing** re-reads each conversion from the other side — a `£110 -> ₦250,000`
+history reads as `0.00044 GBP per NGN` on a GBP tab and `2272.73 NGN per GBP` on
+an NGN one. It is refused if any conversion has no side in the new base, or if a
+rate is declared for it (a tab can't hold a rate against its own base).
 
 ## Not in v1
 

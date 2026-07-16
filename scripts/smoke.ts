@@ -146,4 +146,23 @@ const mkTab = (events: TabEvent[]): Tab => ({
   assert.throws(() => foldTab(tab), /no rate available for NGN/);
 }
 
+// --- rebasing GBP -> NGN: conversions re-read from the other side, everything revalues ---
+{
+  const tab = { ...mkTab([...baseEvents]), base_currency: "NGN" };
+  const fold = foldTab(tab);
+
+  // The same two conversions now read as NGN-per-GBP: 250,000 NGN for 110 GBP.
+  const report = balancesReport(tab);
+  assert.equal(report.rates["GBP"]!.effective, "2272.7273", "£110 bought ₦250,000");
+  assert.equal(report.rates["GBP"]!.source, "conversions");
+  assert.equal(report.rates["NGN"], undefined, "the base currency holds no rate against itself");
+
+  // NGN is now native, so the hotel and the settlement need no rate at all.
+  assert.equal(fold.balances.get("ope")!.toString(), "180000", "paid ₦200,000, received ₦20,000");
+  assert.equal(fold.balances.get("george")!.toString(), "-140000", "owes ₦160,000, settled ₦20,000");
+  assert.equal(fold.balances.get("timi")!.toString(), "-40000");
+  assert.equal(fold.settlementValues.get("s1")!.toString(), "20000", "settlement is native, not converted");
+  zero(tab);
+}
+
 console.log("smoke OK");

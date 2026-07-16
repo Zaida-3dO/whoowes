@@ -363,6 +363,73 @@ export function createServer(): McpServer {
   );
 
   server.registerTool(
+    "set_base_currency",
+    {
+      description:
+        "Change the currency a tab reports balances in. Everything revalues retroactively, and conversions re-read themselves from the new side (a GBP->NGN conversion means 'NGN per GBP' or 'GBP per NGN' depending on the base). Refused if any conversion has no side in the new base, or if a rate is declared for it.",
+      inputSchema: { tab: z.string(), base_currency: currency },
+    },
+    async ({ tab: tabName, base_currency }) =>
+      run(() => {
+        const ledger = load();
+        const tab = findTab(ledger, tabName);
+        const previous = tab.base_currency;
+        if (previous === base_currency) {
+          throw new LedgerError(`tab "${tab.name}" already reports in ${base_currency}`);
+        }
+        // A conversion only carries a rate if one of its sides is the base; otherwise the
+        // fold would silently read the wrong side as the base amount.
+        for (const ev of tab.events) {
+          if (ev.kind === "conversion" && ev.from_currency !== base_currency && ev.to_currency !== base_currency) {
+            throw new LedgerError(
+              `cannot rebase to ${base_currency}: the conversion on ${ev.date} (${ev.from_amount} ${ev.from_currency} -> ${ev.to_amount} ${ev.to_currency}) has no ${base_currency} side. Every conversion must have one side in the base currency.`
+            );
+          }
+        }
+        tab.base_currency = base_currency;
+        try {
+          const fold = foldTab(tab);
+          if (fold.rates.declared.has(base_currency)) {
+            throw new LedgerError(
+              `cannot rebase to ${base_currency}: a rate is declared for it, and a tab cannot hold a rate against its own base. Clear it first (declare_rate with no rate), then rebase.`
+            );
+          }
+        } catch (e) {
+          tab.base_currency = previous;
+          throw e;
+        }
+        save(ledger);
+        return { rebased_from: previous, ...balancesReport(tab) };
+      })
+  );
+
+  server.registerTool(
+    "delete_tab",
+    {
+      description:
+        "Permanently delete a tab and its whole event log. Irreversible and unrecoverable. Tell the user how many events will be lost and get a clear yes before passing confirm: true.",
+      inputSchema: { tab: z.string(), confirm: z.boolean().optional() },
+    },
+    async ({ tab: tabName, confirm }) =>
+      run(() => {
+        const ledger = load();
+        const tab = findTab(ledger, tabName);
+        if (confirm !== true) {
+          throw new LedgerError(
+            `refusing to delete "${tab.name}": it holds ${tab.events.length} event(s) and deletion cannot be undone. Confirm with the user, then pass confirm: true.`
+          );
+        }
+        ledger.tabs = ledger.tabs.filter((t) => t.id !== tab.id);
+        save(ledger);
+        return {
+          deleted: tab.name,
+          events_discarded: tab.events.length,
+          tabs_remaining: ledger.tabs.map((t) => t.name),
+        };
+      })
+  );
+
+  server.registerTool(
     "undo_last_event",
     {
       description: "Remove the most recent event from a tab (use when an entry was recorded wrongly).",
