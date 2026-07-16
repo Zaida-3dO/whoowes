@@ -2,7 +2,9 @@ FROM node:22-alpine
 WORKDIR /app
 
 COPY package.json package-lock.json ./
-RUN npm ci
+# --cache: the default /root/.npm trips over some overlayfs setups (QNAP hit
+# "ENOENT ... File exists" in _cacache); a fresh cache dir sidesteps it.
+RUN npm ci --no-audit --no-fund --cache /tmp/npm-cache
 
 COPY tsconfig.json ./
 COPY src ./src
