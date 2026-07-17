@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { Decimal } from "decimal.js";
 import { balancesReport, foldTab, personView } from "../src/fold.js";
 import { Tab, TabEvent } from "../src/types.js";
@@ -163,6 +166,152 @@ const mkTab = (events: TabEvent[]): Tab => ({
   assert.equal(fold.balances.get("timi")!.toString(), "-40000");
   assert.equal(fold.settlementValues.get("s1")!.toString(), "20000", "settlement is native, not converted");
   zero(tab);
+}
+
+// ── Tool-level: edit_event / remove_event driven through a real MCP client ──────────
+// These go through the registered handlers (schema, validation, fold-then-save), not just
+// the fold, because that is where the position-preserving guarantee actually lives.
+{
+  // store.ts reads WHOOWES_DIR at module load, so set it before importing anything that
+  // pulls it in — hence the dynamic imports below.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "whoowes-smoke-"));
+  process.env.WHOOWES_DIR = dir;
+
+  const { createServer } = await import("../src/mcp.js");
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+
+  const server = createServer();
+  const client = new Client({ name: "smoke", version: "0.0.0" });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
+
+  const raw = async (name: string, args: Record<string, unknown> = {}) => {
+    const r = (await client.callTool({ name, arguments: args })) as {
+      content: { text: string }[];
+      isError?: boolean;
+    };
+    return { text: r.content[0]!.text, isError: r.isError === true };
+  };
+  const call = async (name: string, args: Record<string, unknown> = {}) => {
+    const r = await raw(name, args);
+    assert.ok(!r.isError, `${name} unexpectedly failed: ${r.text}`);
+    return JSON.parse(r.text);
+  };
+  const refused = async (name: string, args: Record<string, unknown>, match: RegExp) => {
+    const r = await raw(name, args);
+    assert.ok(r.isError, `${name} should have been refused but succeeded: ${r.text}`);
+    assert.match(r.text, match);
+    return r.text;
+  };
+  const netOf = (report: any, who: string) =>
+    report.balances.find((b: any) => b.participant === who)?.net;
+
+  // Every tool is reachable, and the two new mutations plus the log listing are registered.
+  const listed = (await client.listTools()).tools.map((t) => t.name).sort();
+  assert.ok(listed.includes("edit_event"), "edit_event registered");
+  assert.ok(listed.includes("remove_event"), "remove_event registered");
+  assert.ok(listed.includes("list_events"), "list_events registered");
+  assert.equal(listed.length, 16, `expected 16 tools, got ${listed.length}: ${listed.join(", ")}`);
+
+  // Rebuild the GBP/NGN scenario through the real tools.
+  await call("create_tab", { name: "lagos", base_currency: "GBP" });
+  for (const p of ["ope", "timi", "george"]) await call("add_participant", { name: p });
+  await call("add_conversion", {
+    tab: "lagos", from_amount: "50", from_currency: "GBP",
+    to_amount: "100000", to_currency: "NGN", date: "2026-07-01",
+  });
+  await call("add_expense", {
+    tab: "lagos", description: "hotel", amount: "200000", currency: "NGN", paid_by: "ope",
+    shares: [{ participant: "timi", pct: "20" }, { participant: "george", pct: "80" }],
+    date: "2026-07-02",
+  });
+  await call("add_settlement", {
+    tab: "lagos", from: "george", to: "ope", amount: "20000", currency: "NGN", date: "2026-07-03",
+  });
+  await call("add_conversion", {
+    tab: "lagos", from_amount: "60", from_currency: "GBP",
+    to_amount: "150000", to_currency: "NGN", date: "2026-07-04",
+  });
+
+  // list_events is the id-discovery path the mutations depend on.
+  const log = await call("list_events", { tab: "lagos" });
+  assert.equal(log.events.length, 4);
+  assert.deepEqual(log.events.map((e: any) => e.kind), ["conversion", "expense", "settlement", "conversion"]);
+  const [c1, e1, s1, c2] = log.events.map((e: any) => e.id) as string[];
+
+  // Baseline matches the fold-level scenario above: settlement locked at £10.
+  const before = await call("get_balances", { tab: "lagos" });
+  assert.equal(netOf(before, "ope"), "78.00");
+  assert.equal((await call("get_person", { tab: "lagos", participant: "george" })).settlements_made[0].base_value, "10.00");
+
+  // ── The position-preserving guarantee ────────────────────────────────────────
+  // Edit the FIRST conversion (£50 -> £100 for the same ₦100,000, so its rate becomes
+  // 0.001). The settlement sits after it and before the second conversion, so it must
+  // relock at 0.001 = £20. A remove-then-append edit would move c1 to the end of the log,
+  // leaving no rate in force at the settlement's point at all — the fold would throw.
+  const edited = await call("edit_event", { tab: "lagos", event_id: c1, from_amount: "100" });
+  assert.equal(edited.position, "1 of 4", "edited event stays at its original index");
+  assert.equal(edited.before.from_amount, "50");
+  assert.equal(edited.after.from_amount, "100");
+  assert.equal(edited.after.id, c1, "id is immutable across an edit");
+  assert.equal(edited.after.kind, "conversion", "kind is immutable across an edit");
+
+  const george = await call("get_person", { tab: "lagos", participant: "george" });
+  assert.equal(george.settlements_made[0].base_value, "20.00", "settlement relocked at the edited rate IN ITS OWN POSITION");
+
+  // ...and the expense revalued retroactively at the new average (160/250,000 = 0.00064).
+  const after = await call("get_balances", { tab: "lagos" });
+  assert.equal(after.rates["NGN"].effective, "0.00064");
+  assert.equal(netOf(after, "ope"), "108.00", "paid £128, received £20");
+  assert.equal(netOf(after, "george"), "-82.40", "owes £102.40, settled £20");
+  assert.equal(netOf(after, "timi"), "-25.60");
+
+  // ── Removing a conversion a later settlement depends on is refused ───────────
+  // c1 is the only rate in force when the settlement happens; dropping it strands it.
+  await refused("remove_event", { tab: "lagos", event_id: c1 }, /no rate available for NGN/);
+
+  // ...and the refusal left nothing behind: the log and every balance are untouched.
+  const afterRefusal = await call("get_balances", { tab: "lagos" });
+  assert.deepEqual(afterRefusal, after, "a refused remove must not mutate the tab");
+  assert.equal((await call("list_events", { tab: "lagos" })).events.length, 4, "refused remove kept the log intact");
+
+  // ── Notes are carried on expenses and surface on the person view ─────────────
+  await call("edit_event", { tab: "lagos", event_id: e1, note: "provisional — not yet booked" });
+  const noted = await call("get_person", { tab: "lagos", participant: "george" });
+  assert.equal(noted.owes[0].note, "provisional — not yet booked");
+  assert.equal(noted.owes[0].id, e1, "person view exposes the event id to edit by");
+
+  // ── Validation is shared with add_expense, and re-run when only the amount moves ──
+  // Percentage shares rescale, so changing the total alone is valid.
+  const rescaled = await call("edit_event", { tab: "lagos", event_id: e1, amount: "100000" });
+  assert.equal(netOf(rescaled, "ope"), "44.00", "half the hotel: paid £64, received £20");
+  assert.equal(netOf(rescaled, "george"), "-31.20");
+  assert.equal(netOf(rescaled, "timi"), "-12.80");
+  await call("edit_event", { tab: "lagos", event_id: e1, amount: "200000" });
+  assert.equal(netOf(await call("get_balances", { tab: "lagos" }), "ope"), "108.00", "restored");
+
+  // Fixed shares stop summing when the total changes -> refused by the shared validator.
+  await call("edit_event", {
+    tab: "lagos", event_id: e1,
+    shares: [{ participant: "timi", amount: "40000" }, { participant: "george", amount: "160000" }],
+  });
+  await refused("edit_event", { tab: "lagos", event_id: e1, amount: "300000" }, /shares sum to 200000 NGN but must sum to 300000 NGN/);
+
+  // A field that belongs to another kind is rejected, not silently ignored.
+  await refused("edit_event", { tab: "lagos", event_id: s1, shares: [{ participant: "timi", pct: "100" }] }, /cannot set shares on a settlement event/);
+  await refused("edit_event", { tab: "lagos", event_id: e1 }, /nothing to edit/);
+  await refused("edit_event", { tab: "lagos", event_id: "nope" }, /no event with id "nope"/);
+
+  // ── Removing a safe event works, by id, from the middle of the log ────────────
+  const removed = await call("remove_event", { tab: "lagos", event_id: s1 });
+  assert.equal(removed.removed.id, s1);
+  assert.equal(removed.removed.kind, "settlement");
+  const logAfter = await call("list_events", { tab: "lagos" });
+  assert.deepEqual(logAfter.events.map((e: any) => e.id), [c1, e1, c2], "middle event gone, order kept");
+  assert.equal(netOf(removed, "george"), "-102.40", "settlement no longer credits george");
+
+  fs.rmSync(dir, { recursive: true, force: true });
 }
 
 console.log("smoke OK");

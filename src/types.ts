@@ -15,6 +15,8 @@ export interface ExpenseEvent {
   currency: string;
   paid_by: string;
   shares: Share[];
+  /** Free-text context for the entry: caveats, what's provisional, why it's split this way. */
+  note?: string;
 }
 
 export interface SettlementEvent {

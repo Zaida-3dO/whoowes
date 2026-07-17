@@ -2,9 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Decimal } from "decimal.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
-import { balancesReport, foldTab, personView, shareAmount } from "./fold.js";
-import { ensureOpen, ensureParticipant, findTab, ledgerFilePath, load, normalizeName, save } from "./store.js";
-import { LedgerError, Tab, TabEvent } from "./types.js";
+import { balancesReport, foldTab, personView, shareAmount, summarize } from "./fold.js";
+import { ensureOpen, ensureParticipant, findEvent, findTab, ledgerFilePath, load, normalizeName, save } from "./store.js";
+import { Ledger, LedgerError, Share, Tab, TabEvent } from "./types.js";
 
 const money = z
   .union([z.string(), z.number()])
@@ -36,16 +36,59 @@ function fail(message: string) {
   return { content: [{ type: "text" as const, text: `ERROR: ${message}` }], isError: true };
 }
 
-/** Appends the event, verifies the whole tab still folds cleanly, and only then persists. */
-function commitEvent(tab: Tab, event: TabEvent, ledgerSave: () => void) {
-  tab.events.push(event);
+/**
+ * Applies a change to the event log, verifies the whole tab still folds cleanly, and only
+ * then persists. The fold is the validator: it is what catches a removed conversion that a
+ * later settlement depended on. A rejected change leaves no trace — the log is restored from
+ * a snapshot, which is why edits must replace a slot with a new object rather than mutate the
+ * event in place (a shallow snapshot shares the object, so an in-place mutation would survive
+ * the restore).
+ */
+function commitLog(tab: Tab, mutate: () => void, ledgerSave: () => void) {
+  const snapshot = [...tab.events];
   try {
+    mutate();
     foldTab(tab);
   } catch (e) {
-    tab.events.pop();
+    tab.events = snapshot;
     throw e;
   }
   ledgerSave();
+}
+
+function commitEvent(tab: Tab, event: TabEvent, ledgerSave: () => void) {
+  commitLog(tab, () => tab.events.push(event), ledgerSave);
+}
+
+/**
+ * Resolves participants, enforces one share mode, and checks the shares allocate exactly the
+ * total. Shared by add_expense and edit_event so an edited expense is held to the same rule —
+ * and re-checked even when only the amount moved, since fixed shares no longer sum to it.
+ */
+function normalizeShares(
+  ledger: Ledger,
+  shares: { participant: string; pct?: string; amount?: string }[],
+  total: Decimal,
+  ccy: string
+): Share[] {
+  const modes = new Set(
+    shares.map((s) => (s.pct !== undefined ? "pct" : s.amount !== undefined ? "amount" : "none"))
+  );
+  if (modes.has("none") || modes.size !== 1) {
+    throw new LedgerError("every share needs either pct or amount, and all shares must use the same one");
+  }
+  const normalized: Share[] = shares.map((s) => ({
+    participant: ensureParticipant(ledger, s.participant),
+    ...(s.pct !== undefined ? { pct: s.pct } : { amount: s.amount! }),
+  }));
+  const sum = normalized.reduce((acc, s) => acc.plus(shareAmount(total, s)), new Decimal(0));
+  if (!sum.equals(total)) {
+    const unit = modes.has("pct") ? "%" : ` ${ccy}`;
+    const sumShown = modes.has("pct") ? sum.div(total).times(100).toString() : sum.toString();
+    const expectedShown = modes.has("pct") ? "100" : total.toString();
+    throw new LedgerError(`shares sum to ${sumShown}${unit} but must sum to ${expectedShown}${unit}`);
+  }
+  return normalized;
 }
 
 function run<T>(fn: () => T) {
@@ -56,6 +99,15 @@ function run<T>(fn: () => T) {
     throw e;
   }
 }
+
+/** What edit_event may patch per kind. `kind` and `id` are immutable — an edit corrects an
+ *  entry, it does not turn one kind of event into another. */
+const EDITABLE_FIELDS: Record<TabEvent["kind"], string[]> = {
+  expense: ["date", "description", "amount", "currency", "paid_by", "shares", "note"],
+  settlement: ["date", "amount", "currency", "from", "to", "note"],
+  conversion: ["date", "from_amount", "from_currency", "to_amount", "to_currency", "note"],
+  rate: ["date", "currency", "rate", "note"],
+};
 
 /**
  * Builds a fully-registered server. A factory rather than a singleton because the
@@ -116,7 +168,7 @@ export function createServer(): McpServer {
     "add_expense",
     {
       description:
-        "Record a shared expense on a tab. Shares allocate the full expense: all pct (summing to 100) or all fixed amounts (summing to the total). Include the payer's own share if they consumed part of it (e.g. '20% timi, 80% george' means the payer consumed nothing).",
+        "Record a shared expense on a tab. Shares allocate the full expense: all pct (summing to 100) or all fixed amounts (summing to the total). Include the payer's own share if they consumed part of it (e.g. '20% timi, 80% george' means the payer consumed nothing). Use note for context that isn't the description: what's provisional, why it's split this way, what it assumes.",
       inputSchema: {
         tab: z.string(),
         description: z.string().trim().min(1),
@@ -132,32 +184,18 @@ export function createServer(): McpServer {
             })
           )
           .min(1),
+        note: z.string().optional(),
         date: isoDate,
       },
     },
-    async ({ tab: tabName, description, amount, currency: ccy, paid_by, shares, date }) =>
+    async ({ tab: tabName, description, amount, currency: ccy, paid_by, shares, note, date }) =>
       run(() => {
         const ledger = load();
         const tab = findTab(ledger, tabName);
         ensureOpen(tab);
         const payer = ensureParticipant(ledger, paid_by);
 
-        const modes = new Set(shares.map((s) => (s.pct !== undefined ? "pct" : s.amount !== undefined ? "amount" : "none")));
-        if (modes.has("none") || modes.size !== 1) {
-          throw new LedgerError("every share needs either pct or amount, and all shares must use the same one");
-        }
-        const total = new Decimal(amount);
-        const normalized = shares.map((s) => ({
-          participant: ensureParticipant(ledger, s.participant),
-          ...(s.pct !== undefined ? { pct: s.pct } : { amount: s.amount! }),
-        }));
-        const sum = normalized.reduce((acc, s) => acc.plus(shareAmount(total, s)), new Decimal(0));
-        if (!sum.equals(total)) {
-          const unit = modes.has("pct") ? "%" : ` ${ccy}`;
-          const sumShown = modes.has("pct") ? sum.div(total).times(100).toString() : sum.toString();
-          const expectedShown = modes.has("pct") ? "100" : total.toString();
-          throw new LedgerError(`shares sum to ${sumShown}${unit} but must sum to ${expectedShown}${unit}`);
-        }
+        const normalized = normalizeShares(ledger, shares, new Decimal(amount), ccy);
 
         commitEvent(
           tab,
@@ -170,6 +208,7 @@ export function createServer(): McpServer {
             currency: ccy,
             paid_by: payer,
             shares: normalized,
+            ...(note ? { note } : {}),
           },
           () => save(ledger)
         );
@@ -426,6 +465,172 @@ export function createServer(): McpServer {
           events_discarded: tab.events.length,
           tabs_remaining: ledger.tabs.map((t) => t.name),
         };
+      })
+  );
+
+  server.registerTool(
+    "list_events",
+    {
+      description:
+        "The tab's raw event log in order, with each event's id and a one-line summary. This is where you get the event_id that edit_event and remove_event need.",
+      inputSchema: { tab: z.string() },
+    },
+    async ({ tab: tabName }) =>
+      run(() => {
+        const tab = findTab(load(), tabName);
+        return {
+          tab: tab.name,
+          base_currency: tab.base_currency,
+          events: tab.events.map((ev, i) => ({
+            position: i + 1,
+            id: ev.id,
+            kind: ev.kind,
+            date: ev.date,
+            summary: summarize(ev),
+          })),
+        };
+      })
+  );
+
+  server.registerTool(
+    "edit_event",
+    {
+      description:
+        "Correct an event that was recorded wrongly, patching only the fields you pass and leaving it where it is in the log. Use list_events to find the event id. Everything downstream revalues, but the event keeps its position, so settlements still lock at the rate that was in force when they happened. Editable fields depend on the event: expense (description, amount, currency, paid_by, shares), settlement (amount, currency, from, to), conversion (from_amount, from_currency, to_amount, to_currency), rate (currency, rate); every kind also takes date and note. To turn a rate declaration into a clearing, remove_event it instead.",
+      inputSchema: {
+        tab: z.string(),
+        event_id: z.string(),
+        date: isoDate,
+        description: z.string().trim().min(1).optional(),
+        amount: money.optional(),
+        currency: currency.optional(),
+        paid_by: z.string().optional(),
+        shares: z
+          .array(z.object({ participant: z.string(), pct: money.optional(), amount: money.optional() }))
+          .min(1)
+          .optional(),
+        from: z.string().optional(),
+        to: z.string().optional(),
+        from_amount: money.optional(),
+        from_currency: currency.optional(),
+        to_amount: money.optional(),
+        to_currency: currency.optional(),
+        rate: money.optional(),
+        note: z.string().optional(),
+      },
+    },
+    async ({ tab: tabName, event_id, ...patch }) =>
+      run(() => {
+        const ledger = load();
+        const tab = findTab(ledger, tabName);
+        ensureOpen(tab);
+        const { event: before, index } = findEvent(tab, event_id);
+
+        const supplied = Object.entries(patch)
+          .filter(([, v]) => v !== undefined)
+          .map(([k]) => k);
+        if (supplied.length === 0) {
+          throw new LedgerError("nothing to edit: pass at least one field to change");
+        }
+        const allowed = EDITABLE_FIELDS[before.kind];
+        const rejected = supplied.filter((k) => !allowed.includes(k));
+        if (rejected.length > 0) {
+          throw new LedgerError(
+            `cannot set ${rejected.join(", ")} on a ${before.kind} event; its editable fields are: ${allowed.join(", ")}`
+          );
+        }
+
+        let after: TabEvent;
+        switch (before.kind) {
+          case "expense": {
+            const amount = patch.amount ?? before.amount;
+            const ccy = patch.currency ?? before.currency;
+            after = {
+              ...before,
+              date: patch.date ?? before.date,
+              description: patch.description?.trim() ?? before.description,
+              amount,
+              currency: ccy,
+              paid_by: patch.paid_by ? ensureParticipant(ledger, patch.paid_by) : before.paid_by,
+              // Re-checked even when only the amount moved: fixed shares no longer sum to it.
+              shares: normalizeShares(ledger, patch.shares ?? before.shares, new Decimal(amount), ccy),
+              ...(patch.note !== undefined ? { note: patch.note } : {}),
+            };
+            break;
+          }
+          case "settlement": {
+            const from = patch.from ? ensureParticipant(ledger, patch.from) : before.from;
+            const to = patch.to ? ensureParticipant(ledger, patch.to) : before.to;
+            if (from === to) throw new LedgerError("from and to must be different participants");
+            after = {
+              ...before,
+              date: patch.date ?? before.date,
+              amount: patch.amount ?? before.amount,
+              currency: patch.currency ?? before.currency,
+              from,
+              to,
+              ...(patch.note !== undefined ? { note: patch.note } : {}),
+            };
+            break;
+          }
+          case "conversion": {
+            const fromCcy = patch.from_currency ?? before.from_currency;
+            const toCcy = patch.to_currency ?? before.to_currency;
+            if (fromCcy === toCcy) throw new LedgerError("from and to currencies must differ");
+            if (fromCcy !== tab.base_currency && toCcy !== tab.base_currency) {
+              throw new LedgerError(
+                `one side of a conversion must be the tab's base currency (${tab.base_currency})`
+              );
+            }
+            after = {
+              ...before,
+              date: patch.date ?? before.date,
+              from_amount: patch.from_amount ?? before.from_amount,
+              from_currency: fromCcy,
+              to_amount: patch.to_amount ?? before.to_amount,
+              to_currency: toCcy,
+              ...(patch.note !== undefined ? { note: patch.note } : {}),
+            };
+            break;
+          }
+          case "rate": {
+            const ccy = patch.currency ?? before.currency;
+            if (ccy === tab.base_currency) {
+              throw new LedgerError(`cannot declare a rate for the base currency (${tab.base_currency})`);
+            }
+            after = {
+              ...before,
+              date: patch.date ?? before.date,
+              currency: ccy,
+              ...(patch.rate !== undefined ? { foreign_per_base: patch.rate } : {}),
+              ...(patch.note !== undefined ? { note: patch.note } : {}),
+            };
+            break;
+          }
+        }
+
+        // Replace the slot rather than mutate: same index, same id, so the fold walks it in
+        // exactly the same order and no settlement relocks at a different rate.
+        commitLog(tab, () => void (tab.events[index] = after), () => save(ledger));
+        return { before, after, position: `${index + 1} of ${tab.events.length}`, ...balancesReport(tab) };
+      })
+  );
+
+  server.registerTool(
+    "remove_event",
+    {
+      description:
+        "Delete any event from a tab by id, not just the most recent one. Refused if the rest of the log then cannot be valued — e.g. removing a conversion that a later settlement locked its rate against. Use get_balances or list_tabs to find the event id.",
+      inputSchema: { tab: z.string(), event_id: z.string() },
+    },
+    async ({ tab: tabName, event_id }) =>
+      run(() => {
+        const ledger = load();
+        const tab = findTab(ledger, tabName);
+        ensureOpen(tab);
+        const { event: removed, index } = findEvent(tab, event_id);
+        commitLog(tab, () => void tab.events.splice(index, 1), () => save(ledger));
+        return { removed, ...balancesReport(tab) };
       })
   );
 

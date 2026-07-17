@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Ledger, LedgerError, Tab } from "./types.js";
+import { Ledger, LedgerError, Tab, TabEvent } from "./types.js";
 
 const DATA_DIR = process.env.WHOOWES_DIR ?? path.join(os.homedir(), ".whoowes");
 const FILE = path.join(DATA_DIR, "ledger.json");
@@ -27,6 +27,19 @@ export function findTab(ledger: Ledger, name: string): Tab {
   const tab = ledger.tabs.find((t) => normalizeName(t.name) === n || t.id === name);
   if (!tab) throw new LedgerError(`no tab named "${name}". Existing tabs: ${ledger.tabs.map((t) => t.name).join(", ") || "(none)"}`);
   return tab;
+}
+
+/** Locates an event by id, with its position — callers must patch in place, never re-append. */
+export function findEvent(tab: Tab, eventId: string): { event: TabEvent; index: number } {
+  const index = tab.events.findIndex((e) => e.id === eventId);
+  if (index === -1) {
+    throw new LedgerError(
+      `no event with id "${eventId}" on tab "${tab.name}". Its ${tab.events.length} event(s) are: ${
+        tab.events.map((e) => `${e.id} (${e.kind})`).join(", ") || "(none)"
+      }`
+    );
+  }
+  return { event: tab.events[index]!, index };
 }
 
 export function ensureOpen(tab: Tab): void {

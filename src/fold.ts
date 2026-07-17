@@ -1,5 +1,5 @@
 import { Decimal } from "decimal.js";
-import { ExpenseEvent, LedgerError, Share, Tab } from "./types.js";
+import { LedgerError, Share, Tab, TabEvent } from "./types.js";
 
 Decimal.set({ precision: 40 });
 
@@ -134,11 +134,14 @@ export function foldTab(tab: Tab): FoldResult {
 }
 
 export interface PersonEntry {
+  /** The originating event's id — pass to edit_event/remove_event to correct it. */
+  id: string;
   date: string;
   description: string;
   amount: string;
   currency: string;
   base_value: string | null;
+  note?: string;
 }
 
 export interface PersonView {
@@ -178,11 +181,13 @@ export function personView(tab: Tab, participant: string): PersonView {
       const total = new Decimal(ev.amount);
       if (ev.paid_by === participant) {
         view.paid.push({
+          id: ev.id,
           date: ev.date,
           description: ev.description,
           amount: total.toString(),
           currency: ev.currency,
           base_value: val(total, ev.currency),
+          ...(ev.note ? { note: ev.note } : {}),
         });
       }
       const share = ev.shares.find((s) => s.participant === participant);
@@ -190,25 +195,49 @@ export function personView(tab: Tab, participant: string): PersonView {
         const amt = shareAmount(total, share);
         const label = share.pct !== undefined ? `${share.pct}% of ${ev.description}` : ev.description;
         view.owes.push({
+          id: ev.id,
           date: ev.date,
           description: label,
           amount: amt.toString(),
           currency: ev.currency,
           base_value: val(amt, ev.currency),
+          ...(ev.note ? { note: ev.note } : {}),
         });
       }
     } else if (ev.kind === "settlement" && (ev.from === participant || ev.to === participant)) {
       const entry: PersonEntry = {
+        id: ev.id,
         date: ev.date,
         description: ev.from === participant ? `paid ${ev.to}` : `received from ${ev.from}`,
         amount: ev.amount,
         currency: ev.currency,
         base_value: fold.settlementValues.get(ev.id)?.toFixed(2) ?? null,
+        ...(ev.note ? { note: ev.note } : {}),
       };
       (ev.from === participant ? view.settlements_made : view.settlements_received).push(entry);
     }
   }
   return view;
+}
+
+/** One human line for an event, for the log listing and the entries table. */
+export function summarize(ev: TabEvent): string {
+  switch (ev.kind) {
+    case "expense":
+      return `${ev.description} — ${ev.amount} ${ev.currency} paid by ${ev.paid_by}, split ${ev.shares
+        .map((s) => `${s.participant} ${s.pct !== undefined ? `${s.pct}%` : s.amount}`)
+        .join(" / ")}${ev.note ? ` (${ev.note})` : ""}`;
+    case "settlement":
+      return `${ev.from} paid ${ev.to} ${ev.amount} ${ev.currency}${ev.note ? ` (${ev.note})` : ""}`;
+    case "conversion":
+      return `converted ${ev.from_amount} ${ev.from_currency} to ${ev.to_amount} ${ev.to_currency}${
+        ev.note ? ` (${ev.note})` : ""
+      }`;
+    case "rate":
+      return ev.foreign_per_base !== undefined
+        ? `declared ${ev.foreign_per_base} ${ev.currency} per 1 base${ev.note ? ` (${ev.note})` : ""}`
+        : `cleared the declared rate for ${ev.currency}${ev.note ? ` (${ev.note})` : ""}`;
+  }
 }
 
 export function balancesReport(tab: Tab) {
