@@ -1,10 +1,14 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Decimal } from "decimal.js";
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { z } from "zod";
 import { balancesReport, foldTab, personView, shareAmount, summarize } from "./fold.js";
 import { ensureOpen, ensureParticipant, findEvent, findTab, ledgerFilePath, load, normalizeName, save } from "./store.js";
 import { Ledger, LedgerError, Share, Tab, TabEvent } from "./types.js";
+import { renderTabList, renderTabPage } from "./view.js";
 
 const money = z
   .union([z.string(), z.number()])
@@ -108,6 +112,50 @@ const EDITABLE_FIELDS: Record<TabEvent["kind"], string[]> = {
   conversion: ["date", "from_amount", "from_currency", "to_amount", "to_currency", "note"],
   rate: ["date", "currency", "rate", "note"],
 };
+
+/**
+ * Same wall-clock stamp the /view route prints, so a rendered file and a served page
+ * are indistinguishable apart from the instant they were generated.
+ */
+function stamp(): string {
+  return new Date().toLocaleString("en-GB", {
+    day: "2-digit", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit",
+    timeZone: process.env.TZ || "Europe/London",
+  });
+}
+
+/** Where display writes. Deliberately NOT the ledger dir: these are disposable renders,
+ *  and the ledger dir is the event log. Haven-in-a-container sets the env var to a media
+ *  dir it can serve; on a PC the OS temp dir is a path the user can just click. */
+function displayDir(): string {
+  return process.env.WHOOWES_DISPLAY_DIR ?? os.tmpdir();
+}
+
+/** Filename-safe slug of a tab name. Empty result (e.g. a name of only punctuation)
+ *  falls back to "tab" so we never produce a dotfile or a bare timestamp. */
+function slugify(name: string): string {
+  const s = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return s || "tab";
+}
+
+/**
+ * Writes a rendered page and returns its absolute path. Mirrors store.ts save(): the
+ * directory is created on demand rather than required to pre-exist.
+ */
+function writePage(slug: string, html: string): string {
+  const dir = displayDir();
+  fs.mkdirSync(dir, { recursive: true });
+  // Sortable, second-resolution, filename-safe. Same tab re-rendered in the same second
+  // overwrites itself, which is the behaviour you want -- it is a render, not a record.
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").replace(/-\d{3}Z$/, "Z");
+  const file = path.join(dir, `whoowes-${slug}-${ts}.html`);
+  fs.writeFileSync(file, html, "utf8");
+  return path.resolve(file);
+}
 
 /**
  * Builds a fully-registered server. A factory rather than a singleton because the
@@ -381,6 +429,58 @@ export function createServer(): McpServer {
             events: t.events.length,
             created_at: t.created_at,
           })),
+        };
+      })
+  );
+
+  server.registerTool(
+    "display",
+    {
+      description:
+        "Render a tab as a standalone HTML page on disk and return its absolute path, for opening in a browser. Shows rates in force, who owes what, every entry with its split, and what has been settled. Pass tab to pick one (omit it to get the tab list, or go straight to the only tab if there is just one), and who to lead with one participant's breakdown. The file is a snapshot of this moment, not a live page: render again to refresh.",
+      inputSchema: {
+        tab: z.string().optional(),
+        who: z.string().optional(),
+      },
+    },
+    async ({ tab: wanted, who }) =>
+      run(() => {
+        const ledger = load();
+        const generatedAt = stamp();
+
+        if (wanted === undefined) {
+          const open = ledger.tabs.filter((t) => t.status === "open");
+          // One obvious tab: go straight to it. Otherwise make the choice explicit.
+          if (open.length === 1 && ledger.tabs.length === 1) {
+            const only = open[0]!;
+            return {
+              rendered: only.name,
+              path: writePage(slugify(only.name), renderTabPage(only, who, generatedAt)),
+              generated_at: generatedAt,
+            };
+          }
+          return {
+            rendered: "tab list",
+            tabs: ledger.tabs.map((t) => t.name),
+            path: writePage("tabs", renderTabList(ledger, generatedAt)),
+            generated_at: generatedAt,
+          };
+        }
+
+        const key = wanted.trim().toLowerCase();
+        const tab = ledger.tabs.find((t) => t.name.trim().toLowerCase() === key || t.id === wanted);
+        // /view answers an unknown tab with a 404 page because a browser has nowhere else to
+        // put the message. A tool does: a refusal reaches the caller directly and leaves no
+        // dead file on disk for them to open.
+        if (!tab) {
+          throw new LedgerError(
+            `no tab named "${wanted}". Existing tabs: ${ledger.tabs.map((t) => t.name).join(", ") || "(none)"}`
+          );
+        }
+        return {
+          rendered: tab.name,
+          path: writePage(slugify(tab.name), renderTabPage(tab, who, generatedAt)),
+          generated_at: generatedAt,
         };
       })
   );

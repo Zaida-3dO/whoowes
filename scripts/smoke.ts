@@ -212,7 +212,8 @@ const mkTab = (events: TabEvent[]): Tab => ({
   assert.ok(listed.includes("edit_event"), "edit_event registered");
   assert.ok(listed.includes("remove_event"), "remove_event registered");
   assert.ok(listed.includes("list_events"), "list_events registered");
-  assert.equal(listed.length, 16, `expected 16 tools, got ${listed.length}: ${listed.join(", ")}`);
+  assert.ok(listed.includes("display"), "display registered");
+  assert.equal(listed.length, 17, `expected 17 tools, got ${listed.length}: ${listed.join(", ")}`);
 
   // Rebuild the GBP/NGN scenario through the real tools.
   await call("create_tab", { name: "lagos", base_currency: "GBP" });
@@ -311,7 +312,100 @@ const mkTab = (events: TabEvent[]): Tab => ({
   assert.deepEqual(logAfter.events.map((e: any) => e.id), [c1, e1, c2], "middle event gone, order kept");
   assert.equal(netOf(removed, "george"), "-102.40", "settlement no longer credits george");
 
+  // ── display renders to disk, mirroring /view's routing ──────────────────────
+  {
+    const out = fs.mkdtempSync(path.join(os.tmpdir(), "whoowes-display-"));
+    process.env.WHOOWES_DISPLAY_DIR = out;
+
+    // Named tab -> that tab's page, at an absolute path, actually on disk.
+    const one = await call("display", { tab: "lagos" });
+    assert.equal(one.rendered, "lagos");
+    assert.ok(path.isAbsolute(one.path), `display must return an absolute path, got ${one.path}`);
+    assert.equal(path.dirname(one.path), out, "display must honour WHOOWES_DISPLAY_DIR");
+    assert.ok(one.path.includes("lagos"), "filename carries the tab slug");
+    const html = fs.readFileSync(one.path, "utf8");
+
+    // The charset declaration is what stops a file:// browser guessing latin-1 and
+    // mojibaking every ₦ and £ on the page. There is no HTTP header to fall back on.
+    assert.match(html, /<meta charset="utf-8">/, "rendered file must declare its charset");
+    assert.match(html, /^<!doctype html>/, "a complete standalone document");
+    assert.ok(html.includes("₦"), "the naira sign survives the write as a real character");
+    assert.ok(!html.includes("�"), "no replacement characters: the file is not mojibaked");
+
+    // Byte-identical to the renderer /view calls, for the same tab at the same stamp.
+    const { renderTabPage } = await import("../src/view.js");
+    const { load } = await import("../src/store.js");
+    const tabNow = load().tabs.find((t: any) => t.name === "lagos")!;
+    const direct = renderTabPage(tabNow, undefined, one.generated_at);
+    assert.equal(html, direct, "display must serve exactly what /view renders");
+
+    // who is passed through as `requested` and changes the page.
+    const withWho = await call("display", { tab: "lagos", who: "george" });
+    const whoHtml = fs.readFileSync(withWho.path, "utf8");
+    assert.notEqual(whoHtml, html, "the who argument must reach the renderer");
+
+    // Exactly one open tab and no tab argument -> straight to it, not the list.
+    const soleTab = await call("display", {});
+    assert.equal(soleTab.rendered, "lagos", "a single open tab is shown directly");
+
+    // Unknown tab is a refusal, not an error page written to disk.
+    const before = fs.readdirSync(out).length;
+    await refused("display", { tab: "nowhere" }, /no tab named "nowhere"/);
+    assert.equal(fs.readdirSync(out).length, before, "a refused display writes no file");
+
+    // Several tabs -> the list, since there is no longer an obvious one.
+    await call("create_tab", { name: "abuja", base_currency: "NGN" });
+    const list = await call("display", {});
+    assert.equal(list.rendered, "tab list");
+    const listHtml = fs.readFileSync(list.path, "utf8");
+    assert.match(listHtml, /<meta charset="utf-8">/);
+    assert.ok(listHtml.includes("lagos") && listHtml.includes("abuja"), "every tab is listed");
+
+    // A closed sole tab is not "obvious" either -> the list, matching /view.
+    await call("delete_tab", { tab: "abuja", confirm: true });
+    await call("set_tab_status", { tab: "lagos", status: "closed" });
+    assert.equal((await call("display", {})).rendered, "tab list", "a closed sole tab still lists");
+    await call("set_tab_status", { tab: "lagos", status: "open" });
+
+    fs.rmSync(out, { recursive: true, force: true });
+    delete process.env.WHOOWES_DISPLAY_DIR;
+  }
+
   fs.rmSync(dir, { recursive: true, force: true });
+}
+
+// ── display on an empty ledger: the zero-tab case, in its own WHOOWES_DIR ──────────
+// store.ts caches WHOOWES_DIR at module load, so an empty ledger needs a fresh module
+// registry -- hence the cache-busting query on the import.
+{
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "whoowes-empty-"));
+  const out = fs.mkdtempSync(path.join(os.tmpdir(), "whoowes-empty-out-"));
+  process.env.WHOOWES_DIR = dir;
+  process.env.WHOOWES_DISPLAY_DIR = out;
+
+  const { createServer } = await import("../src/mcp.js?empty");
+  const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
+  const { InMemoryTransport } = await import("@modelcontextprotocol/sdk/inMemory.js");
+
+  const server = createServer();
+  const client = new Client({ name: "smoke-empty", version: "0.0.0" });
+  const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+  await Promise.all([server.connect(serverSide), client.connect(clientSide)]);
+
+  const r = (await client.callTool({ name: "display", arguments: {} })) as {
+    content: { text: string }[];
+    isError?: boolean;
+  };
+  assert.ok(r.isError !== true, `display on an empty ledger failed: ${r.content[0]!.text}`);
+  const res = JSON.parse(r.content[0]!.text);
+  assert.equal(res.rendered, "tab list", "no tabs at all still renders the list");
+  assert.deepEqual(res.tabs, [], "and reports an empty tab list");
+  const emptyHtml = fs.readFileSync(res.path, "utf8");
+  assert.match(emptyHtml, /<meta charset="utf-8">/);
+  assert.match(emptyHtml, /No tabs yet/, "the empty state, not a crash");
+
+  fs.rmSync(dir, { recursive: true, force: true });
+  fs.rmSync(out, { recursive: true, force: true });
 }
 
 console.log("smoke OK");
