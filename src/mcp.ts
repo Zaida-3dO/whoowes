@@ -3,7 +3,7 @@ import { Decimal } from "decimal.js";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { balancesReport, foldTab, personView, shareAmount, summarize } from "./fold.js";
-import { ensureOpen, ensureParticipant, findEvent, findTab, ledgerFilePath, load, normalizeName, save } from "./store.js";
+import { ensureOpen, ensureParticipant, findEvent, findTab, ledgerFilePath, load, normalizeName, save, withLedger } from "./store.js";
 import { Ledger, LedgerError, Share, Tab, TabEvent } from "./types.js";
 
 const money = z
@@ -127,23 +127,24 @@ export function createServer(): McpServer {
       },
     },
     async ({ name, base_currency }) =>
-      run(() => {
-        const ledger = load();
-        if (ledger.tabs.some((t) => normalizeName(t.name) === normalizeName(name))) {
-          throw new LedgerError(`a tab named "${name}" already exists`);
-        }
-        const tab: Tab = {
-          id: randomUUID(),
-          name: name.trim(),
-          base_currency,
-          status: "open",
-          created_at: new Date().toISOString(),
-          events: [],
-        };
-        ledger.tabs.push(tab);
-        save(ledger);
-        return { created: tab.name, base_currency: tab.base_currency };
-      })
+      run(() =>
+        withLedger((ledger) => {
+          if (ledger.tabs.some((t) => normalizeName(t.name) === normalizeName(name))) {
+            throw new LedgerError(`a tab named "${name}" already exists`);
+          }
+          const tab: Tab = {
+            id: randomUUID(),
+            name: name.trim(),
+            base_currency,
+            status: "open",
+            created_at: new Date().toISOString(),
+            events: [],
+          };
+          ledger.tabs.push(tab);
+          save(ledger);
+          return { created: tab.name, base_currency: tab.base_currency };
+        })
+      )
   );
 
   server.registerTool(
@@ -153,15 +154,16 @@ export function createServer(): McpServer {
       inputSchema: { name: z.string().trim().min(1) },
     },
     async ({ name }) =>
-      run(() => {
-        const ledger = load();
-        const n = normalizeName(name);
-        if (!ledger.participants.includes(n)) {
-          ledger.participants.push(n);
-          save(ledger);
-        }
-        return { participants: ledger.participants };
-      })
+      run(() =>
+        withLedger((ledger) => {
+          const n = normalizeName(name);
+          if (!ledger.participants.includes(n)) {
+            ledger.participants.push(n);
+            save(ledger);
+          }
+          return { participants: ledger.participants };
+        })
+      )
   );
 
   server.registerTool(
@@ -189,31 +191,32 @@ export function createServer(): McpServer {
       },
     },
     async ({ tab: tabName, description, amount, currency: ccy, paid_by, shares, note, date }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        ensureOpen(tab);
-        const payer = ensureParticipant(ledger, paid_by);
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          ensureOpen(tab);
+          const payer = ensureParticipant(ledger, paid_by);
 
-        const normalized = normalizeShares(ledger, shares, new Decimal(amount), ccy);
+          const normalized = normalizeShares(ledger, shares, new Decimal(amount), ccy);
 
-        commitEvent(
-          tab,
-          {
-            kind: "expense",
-            id: randomUUID(),
-            date: date ?? new Date().toISOString().slice(0, 10),
-            description: description.trim(),
-            amount,
-            currency: ccy,
-            paid_by: payer,
-            shares: normalized,
-            ...(note ? { note } : {}),
-          },
-          () => save(ledger)
-        );
-        return balancesReport(tab);
-      })
+          commitEvent(
+            tab,
+            {
+              kind: "expense",
+              id: randomUUID(),
+              date: date ?? new Date().toISOString().slice(0, 10),
+              description: description.trim(),
+              amount,
+              currency: ccy,
+              paid_by: payer,
+              shares: normalized,
+              ...(note ? { note } : {}),
+            },
+            () => save(ledger)
+          );
+          return balancesReport(tab);
+        })
+      )
   );
 
   server.registerTool(
@@ -232,30 +235,31 @@ export function createServer(): McpServer {
       },
     },
     async ({ tab: tabName, from, to, amount, currency: ccy, note, date }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        ensureOpen(tab);
-        const f = ensureParticipant(ledger, from);
-        const t = ensureParticipant(ledger, to);
-        if (f === t) throw new LedgerError("from and to must be different participants");
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          ensureOpen(tab);
+          const f = ensureParticipant(ledger, from);
+          const t = ensureParticipant(ledger, to);
+          if (f === t) throw new LedgerError("from and to must be different participants");
 
-        commitEvent(
-          tab,
-          {
-            kind: "settlement",
-            id: randomUUID(),
-            date: date ?? new Date().toISOString().slice(0, 10),
-            amount,
-            currency: ccy,
-            from: f,
-            to: t,
-            ...(note ? { note } : {}),
-          },
-          () => save(ledger)
-        );
-        return balancesReport(tab);
-      })
+          commitEvent(
+            tab,
+            {
+              kind: "settlement",
+              id: randomUUID(),
+              date: date ?? new Date().toISOString().slice(0, 10),
+              amount,
+              currency: ccy,
+              from: f,
+              to: t,
+              ...(note ? { note } : {}),
+            },
+            () => save(ledger)
+          );
+          return balancesReport(tab);
+        })
+      )
   );
 
   server.registerTool(
@@ -274,31 +278,32 @@ export function createServer(): McpServer {
       },
     },
     async ({ tab: tabName, from_amount, from_currency, to_amount, to_currency, note, date }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        ensureOpen(tab);
-        if (from_currency === to_currency) throw new LedgerError("from and to currencies must differ");
-        if (from_currency !== tab.base_currency && to_currency !== tab.base_currency) {
-          throw new LedgerError(`one side of a conversion must be the tab's base currency (${tab.base_currency})`);
-        }
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          ensureOpen(tab);
+          if (from_currency === to_currency) throw new LedgerError("from and to currencies must differ");
+          if (from_currency !== tab.base_currency && to_currency !== tab.base_currency) {
+            throw new LedgerError(`one side of a conversion must be the tab's base currency (${tab.base_currency})`);
+          }
 
-        commitEvent(
-          tab,
-          {
-            kind: "conversion",
-            id: randomUUID(),
-            date: date ?? new Date().toISOString().slice(0, 10),
-            from_amount,
-            from_currency,
-            to_amount,
-            to_currency,
-            ...(note ? { note } : {}),
-          },
-          () => save(ledger)
-        );
-        return balancesReport(tab);
-      })
+          commitEvent(
+            tab,
+            {
+              kind: "conversion",
+              id: randomUUID(),
+              date: date ?? new Date().toISOString().slice(0, 10),
+              from_amount,
+              from_currency,
+              to_amount,
+              to_currency,
+              ...(note ? { note } : {}),
+            },
+            () => save(ledger)
+          );
+          return balancesReport(tab);
+        })
+      )
   );
 
   server.registerTool(
@@ -315,27 +320,28 @@ export function createServer(): McpServer {
       },
     },
     async ({ tab: tabName, currency: ccy, rate, note, date }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        ensureOpen(tab);
-        if (ccy === tab.base_currency) {
-          throw new LedgerError(`cannot declare a rate for the base currency (${tab.base_currency})`);
-        }
-        commitEvent(
-          tab,
-          {
-            kind: "rate",
-            id: randomUUID(),
-            date: date ?? new Date().toISOString().slice(0, 10),
-            currency: ccy,
-            ...(rate !== undefined ? { foreign_per_base: rate } : {}),
-            ...(note ? { note } : {}),
-          },
-          () => save(ledger)
-        );
-        return balancesReport(tab);
-      })
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          ensureOpen(tab);
+          if (ccy === tab.base_currency) {
+            throw new LedgerError(`cannot declare a rate for the base currency (${tab.base_currency})`);
+          }
+          commitEvent(
+            tab,
+            {
+              kind: "rate",
+              id: randomUUID(),
+              date: date ?? new Date().toISOString().slice(0, 10),
+              currency: ccy,
+              ...(rate !== undefined ? { foreign_per_base: rate } : {}),
+              ...(note ? { note } : {}),
+            },
+            () => save(ledger)
+          );
+          return balancesReport(tab);
+        })
+      )
   );
 
   server.registerTool(
@@ -392,13 +398,14 @@ export function createServer(): McpServer {
       inputSchema: { tab: z.string(), status: z.enum(["open", "closed"]) },
     },
     async ({ tab: tabName, status }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        tab.status = status;
-        save(ledger);
-        return { tab: tab.name, status: tab.status };
-      })
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          tab.status = status;
+          save(ledger);
+          return { tab: tab.name, status: tab.status };
+        })
+      )
   );
 
   server.registerTool(
@@ -409,37 +416,38 @@ export function createServer(): McpServer {
       inputSchema: { tab: z.string(), base_currency: currency },
     },
     async ({ tab: tabName, base_currency }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        const previous = tab.base_currency;
-        if (previous === base_currency) {
-          throw new LedgerError(`tab "${tab.name}" already reports in ${base_currency}`);
-        }
-        // A conversion only carries a rate if one of its sides is the base; otherwise the
-        // fold would silently read the wrong side as the base amount.
-        for (const ev of tab.events) {
-          if (ev.kind === "conversion" && ev.from_currency !== base_currency && ev.to_currency !== base_currency) {
-            throw new LedgerError(
-              `cannot rebase to ${base_currency}: the conversion on ${ev.date} (${ev.from_amount} ${ev.from_currency} -> ${ev.to_amount} ${ev.to_currency}) has no ${base_currency} side. Every conversion must have one side in the base currency.`
-            );
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          const previous = tab.base_currency;
+          if (previous === base_currency) {
+            throw new LedgerError(`tab "${tab.name}" already reports in ${base_currency}`);
           }
-        }
-        tab.base_currency = base_currency;
-        try {
-          const fold = foldTab(tab);
-          if (fold.rates.declared.has(base_currency)) {
-            throw new LedgerError(
-              `cannot rebase to ${base_currency}: a rate is declared for it, and a tab cannot hold a rate against its own base. Clear it first (declare_rate with no rate), then rebase.`
-            );
+          // A conversion only carries a rate if one of its sides is the base; otherwise the
+          // fold would silently read the wrong side as the base amount.
+          for (const ev of tab.events) {
+            if (ev.kind === "conversion" && ev.from_currency !== base_currency && ev.to_currency !== base_currency) {
+              throw new LedgerError(
+                `cannot rebase to ${base_currency}: the conversion on ${ev.date} (${ev.from_amount} ${ev.from_currency} -> ${ev.to_amount} ${ev.to_currency}) has no ${base_currency} side. Every conversion must have one side in the base currency.`
+              );
+            }
           }
-        } catch (e) {
-          tab.base_currency = previous;
-          throw e;
-        }
-        save(ledger);
-        return { rebased_from: previous, ...balancesReport(tab) };
-      })
+          tab.base_currency = base_currency;
+          try {
+            const fold = foldTab(tab);
+            if (fold.rates.declared.has(base_currency)) {
+              throw new LedgerError(
+                `cannot rebase to ${base_currency}: a rate is declared for it, and a tab cannot hold a rate against its own base. Clear it first (declare_rate with no rate), then rebase.`
+              );
+            }
+          } catch (e) {
+            tab.base_currency = previous;
+            throw e;
+          }
+          save(ledger);
+          return { rebased_from: previous, ...balancesReport(tab) };
+        })
+      )
   );
 
   server.registerTool(
@@ -450,22 +458,23 @@ export function createServer(): McpServer {
       inputSchema: { tab: z.string(), confirm: z.boolean().optional() },
     },
     async ({ tab: tabName, confirm }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        if (confirm !== true) {
-          throw new LedgerError(
-            `refusing to delete "${tab.name}": it holds ${tab.events.length} event(s) and deletion cannot be undone. Confirm with the user, then pass confirm: true.`
-          );
-        }
-        ledger.tabs = ledger.tabs.filter((t) => t.id !== tab.id);
-        save(ledger);
-        return {
-          deleted: tab.name,
-          events_discarded: tab.events.length,
-          tabs_remaining: ledger.tabs.map((t) => t.name),
-        };
-      })
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          if (confirm !== true) {
+            throw new LedgerError(
+              `refusing to delete "${tab.name}": it holds ${tab.events.length} event(s) and deletion cannot be undone. Confirm with the user, then pass confirm: true.`
+            );
+          }
+          ledger.tabs = ledger.tabs.filter((t) => t.id !== tab.id);
+          save(ledger);
+          return {
+            deleted: tab.name,
+            events_discarded: tab.events.length,
+            tabs_remaining: ledger.tabs.map((t) => t.name),
+          };
+        })
+      )
   );
 
   server.registerTool(
@@ -520,100 +529,101 @@ export function createServer(): McpServer {
       },
     },
     async ({ tab: tabName, event_id, ...patch }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        ensureOpen(tab);
-        const { event: before, index } = findEvent(tab, event_id);
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          ensureOpen(tab);
+          const { event: before, index } = findEvent(tab, event_id);
 
-        const supplied = Object.entries(patch)
-          .filter(([, v]) => v !== undefined)
-          .map(([k]) => k);
-        if (supplied.length === 0) {
-          throw new LedgerError("nothing to edit: pass at least one field to change");
-        }
-        const allowed = EDITABLE_FIELDS[before.kind];
-        const rejected = supplied.filter((k) => !allowed.includes(k));
-        if (rejected.length > 0) {
-          throw new LedgerError(
-            `cannot set ${rejected.join(", ")} on a ${before.kind} event; its editable fields are: ${allowed.join(", ")}`
-          );
-        }
+          const supplied = Object.entries(patch)
+            .filter(([, v]) => v !== undefined)
+            .map(([k]) => k);
+          if (supplied.length === 0) {
+            throw new LedgerError("nothing to edit: pass at least one field to change");
+          }
+          const allowed = EDITABLE_FIELDS[before.kind];
+          const rejected = supplied.filter((k) => !allowed.includes(k));
+          if (rejected.length > 0) {
+            throw new LedgerError(
+              `cannot set ${rejected.join(", ")} on a ${before.kind} event; its editable fields are: ${allowed.join(", ")}`
+            );
+          }
 
-        let after: TabEvent;
-        switch (before.kind) {
-          case "expense": {
-            const amount = patch.amount ?? before.amount;
-            const ccy = patch.currency ?? before.currency;
-            after = {
-              ...before,
-              date: patch.date ?? before.date,
-              description: patch.description?.trim() ?? before.description,
-              amount,
-              currency: ccy,
-              paid_by: patch.paid_by ? ensureParticipant(ledger, patch.paid_by) : before.paid_by,
-              // Re-checked even when only the amount moved: fixed shares no longer sum to it.
-              shares: normalizeShares(ledger, patch.shares ?? before.shares, new Decimal(amount), ccy),
-              ...(patch.note !== undefined ? { note: patch.note } : {}),
-            };
-            break;
-          }
-          case "settlement": {
-            const from = patch.from ? ensureParticipant(ledger, patch.from) : before.from;
-            const to = patch.to ? ensureParticipant(ledger, patch.to) : before.to;
-            if (from === to) throw new LedgerError("from and to must be different participants");
-            after = {
-              ...before,
-              date: patch.date ?? before.date,
-              amount: patch.amount ?? before.amount,
-              currency: patch.currency ?? before.currency,
-              from,
-              to,
-              ...(patch.note !== undefined ? { note: patch.note } : {}),
-            };
-            break;
-          }
-          case "conversion": {
-            const fromCcy = patch.from_currency ?? before.from_currency;
-            const toCcy = patch.to_currency ?? before.to_currency;
-            if (fromCcy === toCcy) throw new LedgerError("from and to currencies must differ");
-            if (fromCcy !== tab.base_currency && toCcy !== tab.base_currency) {
-              throw new LedgerError(
-                `one side of a conversion must be the tab's base currency (${tab.base_currency})`
-              );
+          let after: TabEvent;
+          switch (before.kind) {
+            case "expense": {
+              const amount = patch.amount ?? before.amount;
+              const ccy = patch.currency ?? before.currency;
+              after = {
+                ...before,
+                date: patch.date ?? before.date,
+                description: patch.description?.trim() ?? before.description,
+                amount,
+                currency: ccy,
+                paid_by: patch.paid_by ? ensureParticipant(ledger, patch.paid_by) : before.paid_by,
+                // Re-checked even when only the amount moved: fixed shares no longer sum to it.
+                shares: normalizeShares(ledger, patch.shares ?? before.shares, new Decimal(amount), ccy),
+                ...(patch.note !== undefined ? { note: patch.note } : {}),
+              };
+              break;
             }
-            after = {
-              ...before,
-              date: patch.date ?? before.date,
-              from_amount: patch.from_amount ?? before.from_amount,
-              from_currency: fromCcy,
-              to_amount: patch.to_amount ?? before.to_amount,
-              to_currency: toCcy,
-              ...(patch.note !== undefined ? { note: patch.note } : {}),
-            };
-            break;
-          }
-          case "rate": {
-            const ccy = patch.currency ?? before.currency;
-            if (ccy === tab.base_currency) {
-              throw new LedgerError(`cannot declare a rate for the base currency (${tab.base_currency})`);
+            case "settlement": {
+              const from = patch.from ? ensureParticipant(ledger, patch.from) : before.from;
+              const to = patch.to ? ensureParticipant(ledger, patch.to) : before.to;
+              if (from === to) throw new LedgerError("from and to must be different participants");
+              after = {
+                ...before,
+                date: patch.date ?? before.date,
+                amount: patch.amount ?? before.amount,
+                currency: patch.currency ?? before.currency,
+                from,
+                to,
+                ...(patch.note !== undefined ? { note: patch.note } : {}),
+              };
+              break;
             }
-            after = {
-              ...before,
-              date: patch.date ?? before.date,
-              currency: ccy,
-              ...(patch.rate !== undefined ? { foreign_per_base: patch.rate } : {}),
-              ...(patch.note !== undefined ? { note: patch.note } : {}),
-            };
-            break;
+            case "conversion": {
+              const fromCcy = patch.from_currency ?? before.from_currency;
+              const toCcy = patch.to_currency ?? before.to_currency;
+              if (fromCcy === toCcy) throw new LedgerError("from and to currencies must differ");
+              if (fromCcy !== tab.base_currency && toCcy !== tab.base_currency) {
+                throw new LedgerError(
+                  `one side of a conversion must be the tab's base currency (${tab.base_currency})`
+                );
+              }
+              after = {
+                ...before,
+                date: patch.date ?? before.date,
+                from_amount: patch.from_amount ?? before.from_amount,
+                from_currency: fromCcy,
+                to_amount: patch.to_amount ?? before.to_amount,
+                to_currency: toCcy,
+                ...(patch.note !== undefined ? { note: patch.note } : {}),
+              };
+              break;
+            }
+            case "rate": {
+              const ccy = patch.currency ?? before.currency;
+              if (ccy === tab.base_currency) {
+                throw new LedgerError(`cannot declare a rate for the base currency (${tab.base_currency})`);
+              }
+              after = {
+                ...before,
+                date: patch.date ?? before.date,
+                currency: ccy,
+                ...(patch.rate !== undefined ? { foreign_per_base: patch.rate } : {}),
+                ...(patch.note !== undefined ? { note: patch.note } : {}),
+              };
+              break;
+            }
           }
-        }
 
-        // Replace the slot rather than mutate: same index, same id, so the fold walks it in
-        // exactly the same order and no settlement relocks at a different rate.
-        commitLog(tab, () => void (tab.events[index] = after), () => save(ledger));
-        return { before, after, position: `${index + 1} of ${tab.events.length}`, ...balancesReport(tab) };
-      })
+          // Replace the slot rather than mutate: same index, same id, so the fold walks it in
+          // exactly the same order and no settlement relocks at a different rate.
+          commitLog(tab, () => void (tab.events[index] = after), () => save(ledger));
+          return { before, after, position: `${index + 1} of ${tab.events.length}`, ...balancesReport(tab) };
+        })
+      )
   );
 
   server.registerTool(
@@ -624,14 +634,15 @@ export function createServer(): McpServer {
       inputSchema: { tab: z.string(), event_id: z.string() },
     },
     async ({ tab: tabName, event_id }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        ensureOpen(tab);
-        const { event: removed, index } = findEvent(tab, event_id);
-        commitLog(tab, () => void tab.events.splice(index, 1), () => save(ledger));
-        return { removed, ...balancesReport(tab) };
-      })
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          ensureOpen(tab);
+          const { event: removed, index } = findEvent(tab, event_id);
+          commitLog(tab, () => void tab.events.splice(index, 1), () => save(ledger));
+          return { removed, ...balancesReport(tab) };
+        })
+      )
   );
 
   server.registerTool(
@@ -641,15 +652,16 @@ export function createServer(): McpServer {
       inputSchema: { tab: z.string() },
     },
     async ({ tab: tabName }) =>
-      run(() => {
-        const ledger = load();
-        const tab = findTab(ledger, tabName);
-        ensureOpen(tab);
-        const removed = tab.events.pop();
-        if (!removed) throw new LedgerError(`tab "${tab.name}" has no events`);
-        save(ledger);
-        return { removed, ...balancesReport(tab) };
-      })
+      run(() =>
+        withLedger((ledger) => {
+          const tab = findTab(ledger, tabName);
+          ensureOpen(tab);
+          const removed = tab.events.pop();
+          if (!removed) throw new LedgerError(`tab "${tab.name}" has no events`);
+          save(ledger);
+          return { removed, ...balancesReport(tab) };
+        })
+      )
   );
 
   return server;

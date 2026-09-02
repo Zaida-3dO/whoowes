@@ -10,11 +10,15 @@ import { LedgerError } from "./types.js";
  * owning one ledger file) rather than per-client over stdio.
  *
  * Stateless: each request gets a fresh server + transport, so any number of clients
- * (and Patrick) can share the tabs. Writes are safe because every tool handler does
- * load -> mutate -> save synchronously within a single tick, and save() is atomic
- * (tmp file + rename) -- so this process serialises all writes to the ledger. That
- * only holds while this is the ONLY writer: don't point another whoowes instance at
- * the same WHOOWES_DIR.
+ * (and Patrick) can share the tabs. Within this process, writes are serialised because
+ * every tool handler does load -> mutate -> save synchronously in a single tick, and
+ * save() is atomic (tmp file + rename).
+ *
+ * Across processes, safety no longer rests on this being the only writer: save() is
+ * compare-and-swap (it refuses to overwrite a ledger that moved since it was read) and
+ * withLedger re-applies the mutation against a fresh read. A second writer on the same
+ * WHOOWES_DIR therefore loses nothing silently -- see store.ts, and the residual
+ * check-to-rename window documented there.
  */
 const PORT = Number(process.env.PORT ?? 8000);
 const HOST = process.env.HOST ?? "0.0.0.0";
