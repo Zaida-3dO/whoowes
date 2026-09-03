@@ -2,12 +2,41 @@
   "name": "whoowes",
   "version": "0.1.0",
   "description": "MCP server for trip/event expense ledgers: shared expenses, settlements, multi-currency with retroactive weighted-average rates",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zaida-3dO/whoowes.git"
+  },
+  "homepage": "https://github.com/Zaida-3dO/whoowes#readme",
+  "bugs": {
+    "url": "https://github.com/Zaida-3dO/whoowes/issues"
+  },
+  "keywords": [
+    "mcp",
+    "modelcontextprotocol",
+    "expenses",
+    "ledger",
+    "settlement",
+    "split-expenses"
+  ],
   "type": "module",
+  "bin": {
+    "whoowes": "dist/server.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
     "start:http": "node dist/http.js",
-    "smoke": "tsx scripts/smoke.ts"
+    "smoke": "tsx scripts/smoke.ts",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
