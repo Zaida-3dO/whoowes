@@ -40,14 +40,35 @@ npm run build     # tsc -> dist/
 npm run smoke     # runs the worked scenario with assertions
 ```
 
+### Publishing
+
+`dist/` is gitignored and built at pack time: `prepack` runs `npm run build`, so
+`npm pack` and `npm publish` both compile first and cannot ship a stale build.
+The `files` allow-list ships `dist/` and `README.md` only — no sources, no
+scripts, no fixtures.
+
+```
+npm pack                    # inspect the tarball first
+npm publish --access public
+```
+
+The `whoowes` binary is `dist/server.js`, which carries a `#!/usr/bin/env node`
+shebang from `src/server.ts` (tsc preserves it and marks the output executable).
+
 ## Transports
 
 Two entry points over the same tools:
 
 | Entry | Command | Use |
 | --- | --- | --- |
-| stdio | `node dist/server.js` | One client spawns its own copy (Claude Code / Desktop). |
+| stdio (published) | `npx -y -p whoowes whoowes` | One client spawns its own copy, no checkout needed. The usual way in. |
+| stdio (from a checkout) | `node dist/server.js` | The same entry point, run from a local build. |
 | streamable-http | `node dist/http.js` | One shared process owns the ledger; many clients connect over HTTP. Serves `POST /mcp`, `GET /health`, and `GET /view`; `PORT` defaults to 8000. |
+
+Both stdio forms are the same program: `dist/server.js` is the package's `whoowes`
+binary. Standard output is the protocol stream, so the server writes its startup
+line (and everything else human-readable) to standard error — one stray line on
+stdout would corrupt the JSON-RPC framing for every message after it.
 
 ### `GET /view` — the live page
 
@@ -74,10 +95,54 @@ last-writer-wins.
 
 ## Register
 
-Claude Code (user scope, works in any project):
+### From npm (recommended)
+
+No checkout, no build, no path to keep correct — npx fetches the published
+package and runs its binary. In an `.mcp.json` (or Claude Desktop's
+`claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "whoowes": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "-p", "whoowes", "whoowes"]
+    }
+  }
+}
+```
+
+The equivalent for Claude Code (user scope, works in any project):
 
 ```
-claude mcp add --scope user whoowes -- node C:/Users/opsij/Documents/Coding/whoowes/dist/server.js
+claude mcp add --scope user whoowes -- npx -y -p whoowes whoowes
+```
+
+To pin a version, use `-p whoowes@0.1.0`. To point the ledger somewhere other
+than `~/.whoowes`, set `WHOOWES_DIR` in the server's `env` block:
+
+```json
+{
+  "mcpServers": {
+    "whoowes": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "-p", "whoowes", "whoowes"],
+      "env": { "WHOOWES_DIR": "/path/to/your/ledger/dir" }
+    }
+  }
+}
+```
+
+Each client that spawns this gets its own process. That is fine for one person
+on one machine, but see the one-writer warning above before pointing two
+spawned copies at the same `WHOOWES_DIR`.
+
+### From a local checkout
+
+```
+claude mcp add --scope user whoowes -- node /path/to/whoowes/dist/server.js
 ```
 
 Claude Desktop (`claude_desktop_config.json`):
@@ -87,7 +152,7 @@ Claude Desktop (`claude_desktop_config.json`):
   "mcpServers": {
     "whoowes": {
       "command": "node",
-      "args": ["C:/Users/opsij/Documents/Coding/whoowes/dist/server.js"]
+      "args": ["/path/to/whoowes/dist/server.js"]
     }
   }
 }
