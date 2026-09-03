@@ -367,6 +367,55 @@ const mkTab = (events: TabEvent[]): Tab => ({
     assert.equal((await call("display", {})).rendered, "tab list", "a closed sole tab still lists");
     await call("set_tab_status", { tab: "lagos", status: "open" });
 
+    // ── every render gets its own file ────────────────────────────────────────
+    // Two reproduced collisions, both of which a slug + one-second timestamp allows:
+    // the second write lands on the first one's path and silently destroys it, while
+    // the tool still reports success. These assert the *response* and the *file* agree.
+
+    // (a) Same tab, two `who` values inside the same second. Distinct renders, so
+    //     distinct files -- the earlier one must survive the later one.
+    {
+      const a = await call("display", { tab: "lagos", who: "george" });
+      const b = await call("display", { tab: "lagos", who: "timi" });
+      assert.notEqual(a.path, b.path, "two renders in the same second must not share a path");
+      assert.ok(fs.existsSync(a.path), "the first render must still exist after the second");
+      const aHtml = fs.readFileSync(a.path, "utf8");
+      const bHtml = fs.readFileSync(b.path, "utf8");
+      assert.notEqual(aHtml, bHtml, "each file holds its own `who` render, not one overwritten twice");
+    }
+
+    // (b) Two genuinely different tabs whose names slugify identically. This is the
+    //     real defect: `display` answered rendered:"Team Dinner" while the file on
+    //     disk held team-dinner's data. Each response must match its own file.
+    {
+      await call("create_tab", { name: "Team Dinner", base_currency: "GBP" });
+      await call("create_tab", { name: "team-dinner", base_currency: "NGN" });
+
+      const upper = await call("display", { tab: "Team Dinner" });
+      const lower = await call("display", { tab: "team-dinner" });
+      assert.equal(upper.rendered, "Team Dinner");
+      assert.equal(lower.rendered, "team-dinner");
+      assert.notEqual(upper.path, lower.path, "tabs that slugify alike must not share a path");
+      assert.ok(fs.existsSync(upper.path), "the first tab's file must survive the second render");
+
+      // The response is only true if the file it names holds that tab's own data. The
+      // two tabs differ in base currency, so each page names its own.
+      const upperHtml = fs.readFileSync(upper.path, "utf8");
+      const lowerHtml = fs.readFileSync(lower.path, "utf8");
+      const { renderTabPage: renderNow } = await import("../src/view.js");
+      const { load: loadNow } = await import("../src/store.js");
+      const tabs = loadNow().tabs;
+      const upperTab = tabs.find((t: any) => t.name === "Team Dinner")!;
+      const lowerTab = tabs.find((t: any) => t.name === "team-dinner")!;
+      assert.equal(upperHtml, renderNow(upperTab, undefined, upper.generated_at),
+        "the file display named must hold Team Dinner's data, not the other tab's");
+      assert.equal(lowerHtml, renderNow(lowerTab, undefined, lower.generated_at),
+        "the file display named must hold team-dinner's data, not the other tab's");
+
+      await call("delete_tab", { tab: "Team Dinner", confirm: true });
+      await call("delete_tab", { tab: "team-dinner", confirm: true });
+    }
+
     fs.rmSync(out, { recursive: true, force: true });
     delete process.env.WHOOWES_DISPLAY_DIR;
   }

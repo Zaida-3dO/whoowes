@@ -149,10 +149,15 @@ function slugify(name: string): string {
 function writePage(slug: string, html: string): string {
   const dir = displayDir();
   fs.mkdirSync(dir, { recursive: true });
-  // Sortable, second-resolution, filename-safe. Same tab re-rendered in the same second
-  // overwrites itself, which is the behaviour you want -- it is a render, not a record.
+  // Sortable, second-resolution, filename-safe -- the slug and timestamp are there to be
+  // read by a human browsing their temp dir. Neither is unique: two renders can land in the
+  // same second, and two different tabs can slugify alike ("Team Dinner" and "team-dinner"
+  // both give team-dinner). Either way the second write would silently destroy the first
+  // while the tool still reported success, so a random suffix -- not the name -- is what
+  // actually carries uniqueness here.
   const ts = new Date().toISOString().replace(/[:.]/g, "-").replace(/-\d{3}Z$/, "Z");
-  const file = path.join(dir, `whoowes-${slug}-${ts}.html`);
+  const unique = randomUUID().slice(0, 8);
+  const file = path.join(dir, `whoowes-${slug}-${ts}-${unique}.html`);
   fs.writeFileSync(file, html, "utf8");
   return path.resolve(file);
 }
@@ -467,16 +472,10 @@ export function createServer(): McpServer {
           };
         }
 
-        const key = wanted.trim().toLowerCase();
-        const tab = ledger.tabs.find((t) => t.name.trim().toLowerCase() === key || t.id === wanted);
         // /view answers an unknown tab with a 404 page because a browser has nowhere else to
-        // put the message. A tool does: a refusal reaches the caller directly and leaves no
-        // dead file on disk for them to open.
-        if (!tab) {
-          throw new LedgerError(
-            `no tab named "${wanted}". Existing tabs: ${ledger.tabs.map((t) => t.name).join(", ") || "(none)"}`
-          );
-        }
+        // put the message. A tool does: findTab throws, run() turns that into a refusal that
+        // reaches the caller directly, and no dead file is written for them to open.
+        const tab = findTab(ledger, wanted);
         return {
           rendered: tab.name,
           path: writePage(slugify(tab.name), renderTabPage(tab, who, generatedAt)),
