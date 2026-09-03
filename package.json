@@ -36,6 +36,7 @@
     "start": "node dist/server.js",
     "start:http": "node dist/http.js",
     "smoke": "tsx scripts/smoke.ts",
+    "test:concurrency": "tsx scripts/concurrency.ts",
     "prepack": "npm run build"
   },
   "dependencies": {
