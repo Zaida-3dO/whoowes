@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { z } from "zod";
 import { balancesReport, foldTab, personView, shareAmount, summarize } from "./fold.js";
-import { ensureOpen, ensureParticipant, findEvent, findTab, ledgerFilePath, load, normalizeName, save, withLedger } from "./store.js";
+import { dataDir, ensureOpen, ensureParticipant, findEvent, findTab, ledgerFilePath, load, normalizeName, save, withLedger } from "./store.js";
 import { Ledger, LedgerError, Share, Tab, TabEvent } from "./types.js";
 import { renderTabList, renderTabPage } from "./view.js";
 
@@ -104,6 +104,69 @@ function run<T>(fn: () => T) {
   }
 }
 
+// ===== per-tool-call logging instrument ======================================
+// One JSON line per tool call, written to a daily file under <WHOOWES_DIR>/logs/.
+// No tool arguments or exception messages are ever read here — see the no-PII
+// contract below. A failed write must never fail the tool call: logToolCall's own
+// try/catch is unconditional, so nothing it does can propagate to a caller.
+// Spec: haven-assistant/first-mate/tasks/T-20260811-mcp-context-cost/reviews/
+//       scout-d-logging-instrument-spec-nairobi-f28.md
+//
+// Path choice, deliberately different from the spec's literal `/data/logs/`: whoowes
+// no longer runs as a container with a `/data` bind mount (the HTTP/Docker deployment
+// was retired September 2026 — see README's Transports section). It runs as an npx
+// stdio process today, spawned per-client with its own `WHOOWES_DIR` (the same env var
+// the ledger already resolves from — see store.ts): `/workspace/haven-assistant/apps/
+// whoowes` under the Patrick gateway, a bare `~/.whoowes` for an unconfigured personal
+// machine, and potentially something else again for a future deployment. Hardcoding
+// `/data/logs` would silently write nowhere meaningful (or fail) in every one of those
+// shapes. Reusing `dataDir()` — the same resolution the ledger itself uses — means logs
+// always land next to the ledger they describe, under every deployment shape, with zero
+// extra configuration.
+const SERVER_NAME = "whoowes";
+
+function logToolCall(tool: string, durationMs: number, ok: boolean, errorClass?: string): void {
+  // Must NEVER throw past this point — a failed write must never fail a tool call.
+  try {
+    const logDir = path.join(dataDir(), "logs");
+    fs.mkdirSync(logDir, { recursive: true });
+    const now = new Date();
+    const day = londonISO(now).slice(0, 10); // "YYYY-MM-DD"
+    const file = path.join(logDir, `tool-calls-${day}.jsonl`);
+    const record: Record<string, unknown> = {
+      ts: londonISO(now),
+      server: SERVER_NAME,
+      tool,
+      duration_ms: Math.round(durationMs * 10) / 10,
+      ok,
+    };
+    if (errorClass) record.error_class = errorClass;
+    fs.appendFileSync(file, JSON.stringify(record) + "\n", "utf8");
+  } catch {
+    // disk full / read-only volume / anything else — swallow, never surface to the caller
+  }
+}
+
+/** Dependency-free Europe/London ISO-8601-with-offset formatter (e.g. "...+01:00" in
+ *  BST, "...+00:00" in GMT). Node's own Intl/Date resolves Europe/London correctly
+ *  regardless of host OS tzdata, because Node ships its own bundled ICU/tzdata. */
+function londonISO(d: Date): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/London", hourCycle: "h23",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(d).reduce((a, p) => ((a[p.type] = p.value), a), {} as Record<string, string>);
+  const asLondonUTC = Date.UTC(+parts.year!, +parts.month! - 1, +parts.day!, +parts.hour!, +parts.minute!, +parts.second!);
+  const offsetMin = Math.round((asLondonUTC - d.getTime()) / 60000);
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  const oh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const om = String(abs % 60).padStart(2, "0");
+  const ms = String(d.getMilliseconds()).padStart(3, "0");
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}.${ms}${sign}${oh}:${om}`;
+}
+// ===== end logging instrument =================================================
+
 /** What edit_event may patch per kind. `kind` and `id` are immutable — an edit corrects an
  *  entry, it does not turn one kind of event into another. */
 const EDITABLE_FIELDS: Record<TabEvent["kind"], string[]> = {
@@ -168,6 +231,38 @@ function writePage(slug: string, html: string): string {
  */
 export function createServer(): McpServer {
   const server = new McpServer({ name: "whoowes", version: "0.1.0" });
+
+  // ===== per-tool-call logging instrument =====================================
+  // Wraps McpServer's OWN registration method once, so every existing
+  // server.registerTool(...) call below (unedited) gets timed + logged automatically.
+  // CRITICAL: .bind(server) — a bare `server.registerTool` reference loses its `this`
+  // binding in JS, and registerTool's body reads `this._registeredTools` — an unbound
+  // call throws immediately.
+  const _origRegisterTool = server.registerTool.bind(server);
+  server.registerTool = ((name: string, config: any, cb: (...a: any[]) => any) => {
+    const wrapped = async (...args: any[]) => {
+      const t0 = process.hrtime.bigint();
+      try {
+        const result = await cb(...args);
+        const durationMs = Number(process.hrtime.bigint() - t0) / 1e6;
+        // whoowes' own run()/fail() helpers return {isError:true} rather than throwing
+        // for expected business-rule failures (LedgerError) — ok must reflect that, not
+        // just "didn't throw".
+        logToolCall(name, durationMs, !(result && (result as any).isError));
+        return result;
+      } catch (e) {
+        const durationMs = Number(process.hrtime.bigint() - t0) / 1e6;
+        // error_class only — NEVER e.message: LedgerError messages routinely embed tab
+        // names, descriptions, participants and amounts (see the throw sites throughout
+        // this file, e.g. set_base_currency's rebase refusal). See the no-PII contract
+        // above logToolCall.
+        logToolCall(name, durationMs, false, e instanceof Error ? e.constructor.name : "Error");
+        throw e; // re-throw unchanged — existing MCP error handling is untouched
+      }
+    };
+    return _origRegisterTool(name, config, wrapped);
+  }) as typeof server.registerTool;
+  // ===== end logging instrument =================================================
 
   server.registerTool(
     "create_tab",

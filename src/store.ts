@@ -187,3 +187,11 @@ export function ensureParticipant(ledger: Ledger, name: string): string {
 export function ledgerFilePath(): string {
   return FILE;
 }
+
+/** The resolved data directory (`WHOOWES_DIR`, defaulting to `~/.whoowes`) — the same
+ *  root the ledger lives under, so anything else that needs a durable, per-deployment
+ *  writable directory (e.g. tool-call logs) resolves it the same way rather than
+ *  hardcoding a path that only holds for one deployment shape. */
+export function dataDir(): string {
+  return DATA_DIR;
+}
