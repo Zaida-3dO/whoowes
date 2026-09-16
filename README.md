@@ -76,41 +76,51 @@ shebang from `src/server.ts` (tsc preserves it and marks the output executable).
 
 ## Transports
 
-Two entry points over the same tools:
+Stdio is the only transport:
 
 | Entry | Command | Use |
 | --- | --- | --- |
 | stdio (published) | `npx -y -p whoowes whoowes` | One client spawns its own copy, no checkout needed. The usual way in. |
 | stdio (from a checkout) | `node dist/server.js` | The same entry point, run from a local build. |
-| streamable-http | `node dist/http.js` | One shared process owns the ledger; many clients connect over HTTP. Serves `POST /mcp`, `GET /health`, and `GET /view`; `PORT` defaults to 8000. |
+
+There was once a streamable-HTTP entry point (`dist/http.js`, serving `POST /mcp`,
+`GET /health` and `GET /view`) for running whoowes as one shared process. It was
+retired along with its container in September 2026, and `src/http.ts`, the express
+dependency and the Dockerfile were removed with it. The HTML page it served lives
+on as the `display` tool below.
 
 Both stdio forms are the same program: `dist/server.js` is the package's `whoowes`
 binary. Standard output is the protocol stream, so the server writes its startup
 line (and everything else human-readable) to standard error — one stray line on
 stdout would corrupt the JSON-RPC framing for every message after it.
 
-### `GET /view` — the live page
+### `display` — the rendered page
 
-The same process renders a read-only HTML page of a tab: position cards and a
-per-currency waterfall for one participant, then every entry with its share
-assignment, the net per person, and the settlements. It folds the log on each
-request, so unlike a hand-built snapshot it cannot go stale.
+The `display` tool writes a read-only HTML page of a tab to a file and returns its
+path: position cards and a per-currency waterfall for one participant, then every
+entry with its share assignment, the net per person, and the settlements. It folds
+the log at render time, so unlike a hand-built snapshot it cannot go stale — but it
+*is* a snapshot once written, so re-render to pick up later events.
 
-- `/view` — the only open tab, or a list to pick from
-- `/view?tab=<name>` — a specific tab
-- `/view?tab=<name>&who=<participant>` — focus the cards and waterfall on someone
-  (defaults to the largest position)
+- `display` with no `tab` — the only open tab, or a list of all of them
+- `display` with `tab: <name>` — a specific tab
+- `display` with `tab: <name>, who: <participant>` — focus the cards and waterfall
+  on someone
+
+Because the output is a standalone file opened over `file://`, the page carries **no
+navigation**: there is no server to answer a link. Participant names and tab names
+are rendered as plain marks, and each row shows the `who`/`tab` argument that renders
+that view instead. Re-run `display` with those arguments to move around.
 
 It states a combined cross-currency figure **only** when every currency involved
 has a real rate behind it; otherwise it names the missing rate rather than
 assuming one.
 
-**Only ever run one writer against a given `WHOOWES_DIR`.** The HTTP server is
-safe for concurrent clients because every tool handler does load → mutate → save
-synchronously in one tick and `save()` is atomic (tmp file + rename), so the
-process serialises all writes. Two *separate* instances on the same file (e.g.
-two stdio clones pointed at a shared folder) have no such guarantee and will
-last-writer-wins.
+**Only ever run one writer against a given `WHOOWES_DIR`.** Within a single process
+every tool handler does load → mutate → save synchronously in one tick and `save()`
+is compare-and-swap (it refuses to overwrite a ledger that moved since it was read),
+so a concurrent writer loses nothing silently. Two *separate* instances on the same
+file still race at the check-to-rename window — see the note in `src/store.ts`.
 
 ## Register
 

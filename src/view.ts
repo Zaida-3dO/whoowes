@@ -88,7 +88,18 @@ function niceBound(v: Decimal): Decimal {
   return mag.times(10).times(v.isNegative() ? -1 : 1);
 }
 
-const href = (tab: Tab, extra = "") => `?tab=${encodeURIComponent(tab.name)}${extra}`;
+/**
+ * These pages are written to disk by the `display` tool and opened over `file://` — there is
+ * no server behind them any more. A `?tab=…&who=…` link therefore resolves to the SAME file
+ * with the query silently dropped, and an absolute `/view` resolves to `file:///C:/view`.
+ *
+ * So navigation is rendered as inert markup rather than anchors: a chip that looks tappable
+ * and does nothing is worse than one that never offered. The name classes are kept so the
+ * styling is unchanged, and the caller is told the tool argument that actually gets them
+ * there — `display` takes `tab` and `who`, which is the real navigation now.
+ */
+const personMark = (name: string, cls: string, extra = "") =>
+  `<span class="${cls}">${esc(name)}${extra}</span>`;
 
 // ── Rates in force ─────────────────────────────────────────────────────────────
 
@@ -175,11 +186,11 @@ function renderWhoOwesWhat(tab: Tab, who: string | undefined): string {
             ? "Is owed"
             : "Owes";
       return `<tr${b.participant === who ? ' class="is-focus"' : ""}>
-        <td><a class="plink" href="${href(tab, `&who=${encodeURIComponent(b.participant)}`)}#breakdown"><strong>${esc(b.participant)}</strong></a></td>
+        <td><span class="plink"><strong>${esc(b.participant)}</strong></span></td>
         <td class="r net ${cls}">${money(net, tab.base_currency, true)}</td>
         ${cols}
         <td class="standing">${standing}</td>
-        <td class="r"><a class="lnk" href="${href(tab, `&who=${encodeURIComponent(b.participant)}`)}#breakdown">breakdown →</a></td>
+        <td class="r"><span class="muted-hint">who: ${esc(b.participant)}</span></td>
       </tr>`;
     })
     .join("");
@@ -205,10 +216,9 @@ function renderEntries(tab: Tab): string {
   const rows = tab.events
     .map((ev, i) => {
       const lead = `<td class="idx">${i + 1}</td><td class="date">${esc(ev.date)}</td>`;
-      // People chips are real links to that person's breakdown — a chip that looks
+      // People chips are inert marks, not links: see personMark. A chip that looks
       // tappable and isn't is an affordance lie.
-      const person = (name: string, cls: string, extra = "") =>
-        `<a class="${cls}" href="${href(tab, `&who=${encodeURIComponent(name)}`)}#breakdown">${esc(name)}${extra}</a>`;
+      const person = (name: string, cls: string, extra = "") => personMark(name, cls, extra);
       if (ev.kind === "expense") {
         const chips = ev.shares
           .map((s) => person(s.participant, "who", ` <span class="chip-val">${esc(shareLabel(s, ev.currency))}</span>`))
@@ -261,8 +271,7 @@ function renderSettlements(tab: Tab, fold: FoldResult): string {
       <p class="empty-p">Every figure above is an obligation, not a receipt — nothing has been settled between anyone on this tab.</p>
     </div>`;
   }
-  const person = (name: string, cls: string) =>
-    `<a class="${cls}" href="${href(tab, `&who=${encodeURIComponent(name)}`)}#breakdown">${esc(name)}</a>`;
+  const person = (name: string, cls: string) => personMark(name, cls);
   const rows = settlements
     .map((ev) => {
       const locked = fold.settlementValues.get(ev.id);
@@ -472,7 +481,7 @@ function renderBreakdown(tab: Tab, fold: FoldResult, who: string | undefined): s
   if (people.length === 0) return "";
 
   const selector = people
-    .map((p) => `<a class="chip ${p === who ? "is-on" : ""}" href="${href(tab, `&who=${encodeURIComponent(p)}`)}#breakdown">${esc(p)}</a>`)
+    .map((p) => `<span class="chip ${p === who ? "is-on" : ""}">${esc(p)}</span>`)
     .join("");
 
   const detail = who
@@ -487,7 +496,9 @@ function renderBreakdown(tab: Tab, fold: FoldResult, who: string | undefined): s
       <span class="key"><span class="swatch" style="background:var(--critical)"></span> Closing — owes</span>
     </div>
     <div class="falls">${currenciesFor(tab, who).map((c) => renderTrack(tab, fold, who, c)).join("")}</div>` : ""}`
-    : `<p class="hint">Pick a person to see their position built step by step from the entries.</p>`;
+    : `<p class="hint">Render this tab again with a <code>who</code> to see that person's position
+         built step by step from the entries — the <code>display</code> tool takes
+         <code>tab</code> and <code>who</code>.</p>`;
 
   return `
   <section class="sec" id="breakdown">
@@ -511,7 +522,7 @@ export function renderTabPage(tab: Tab, requested: string | undefined, generated
 
   const body = `
   <header class="masthead">
-    <div class="eyebrow"><a class="lnk" href="/view">whoowes</a> · live ledger · base ${esc(tab.base_currency)}</div>
+    <div class="eyebrow">whoowes · live ledger · base ${esc(tab.base_currency)}</div>
     <h1>${esc(tab.name)}</h1>
     <p class="dek">Folded from the event log on every request — there is no snapshot to go stale. Every figure is derived; nothing is typed in.</p>
     <div class="asof">
@@ -556,11 +567,11 @@ export function renderTabList(ledger: Ledger, generatedAt: string): string {
   const rows = ledger.tabs
     .map(
       (t) => `<tr>
-        <td><a class="plink" href="?tab=${encodeURIComponent(t.name)}"><strong>${esc(t.name)}</strong></a></td>
+        <td><span class="plink"><strong>${esc(t.name)}</strong></span></td>
         <td>${esc(t.status)}</td>
         <td>${esc(t.base_currency)}</td>
         <td class="r num">${t.events.length}</td>
-        <td class="r"><a class="lnk" href="?tab=${encodeURIComponent(t.name)}">open →</a></td>
+        <td class="r"><span class="muted-hint">tab: ${esc(t.name)}</span></td>
       </tr>`
     )
     .join("");
@@ -588,7 +599,7 @@ export function renderError(message: string): string {
     `<header class="masthead"><div class="eyebrow">whoowes</div><h1>Nothing to show</h1></header>
      <section class="sec"><div class="empty"><div class="empty-fig">—</div>
      <div class="empty-t">${esc(message)}</div>
-     <p class="empty-p"><a class="lnk" href="/view">Back to all tabs</a></p></div></section>`
+     <p class="empty-p">Run the <code>display</code> tool with no <code>tab</code> to list every tab.</p></div></section>`
   );
 }
 
@@ -643,10 +654,12 @@ function page(title: string, body: string): string {
   @media (max-width:600px){.wrap{padding:28px 16px 64px}}
   .num{font-variant-numeric:tabular-nums}
   .dim{color:var(--ink-3)}
-  a.lnk{color:var(--in);text-decoration:none}
-  a.lnk:hover{text-decoration:underline}
-  a.plink{color:var(--ink);text-decoration:none;border-bottom:1px solid var(--rule-strong)}
-  a.plink:hover{border-bottom-color:var(--in);color:var(--in)}
+  /* These pages are static files opened over file://, so nothing here navigates. The marks
+     below keep the visual hierarchy of the old links without any hover or pointer affordance
+     that would imply a click does something. */
+  .lnk{color:var(--in);text-decoration:none}
+  .plink{color:var(--ink);border-bottom:1px solid var(--rule-strong)}
+  .muted-hint{font-size:12px;color:var(--ink-3);font-variant-numeric:tabular-nums}
 
   .masthead{border-bottom:2px solid var(--ink);padding-bottom:16px;margin-bottom:8px}
   .eyebrow{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);font-weight:600}
@@ -673,7 +686,6 @@ function page(title: string, body: string): string {
   .selector{margin-bottom:6px}
   .chip{display:inline-flex;align-items:center;font-size:13px;padding:4px 11px;border-radius:999px;
     background:var(--card);border:1px solid var(--rule);color:var(--ink-2);text-decoration:none;line-height:1.4}
-  .chip:hover{border-color:var(--in);color:var(--in)}
   .chip.is-on{background:var(--in);border-color:var(--in);color:#fff;font-weight:600}
 
   /* Position cards — sans, proportional figures (never serif, never tabular at display size).
@@ -752,10 +764,7 @@ function page(title: string, body: string): string {
     padding:2px 7px;border-radius:4px;white-space:nowrap}
   .who .chip-val{font-size:11px;color:var(--ink-2);font-variant-numeric:tabular-nums}
   .who.is-payer{background:transparent;border-color:var(--in);color:var(--in);font-weight:600}
-  a.who:hover{border-color:var(--in)}
   .chips{display:flex;flex-wrap:wrap;gap:5px}
-  a.lnk:focus-visible,a.plink:focus-visible,a.who:focus-visible,.chip:focus-visible{
-    outline:2px solid var(--in);outline-offset:2px;border-radius:4px}
   @media (max-width:600px){.chip{padding:8px 14px}.selector{gap:7px}}
   .net{font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}
   .net.owes{color:var(--critical-ink)}
