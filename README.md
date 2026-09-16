@@ -40,12 +40,29 @@ npm run build     # tsc -> dist/
 npm run smoke     # runs the worked scenario with assertions
 ```
 
+`smoke` and `test:concurrency` are **checkout-only**: they run TypeScript under
+`tsx` (a devDependency) against `scripts/`, and the `files` allow-list ships
+neither. They stay in the manifest because they are the development entry
+points; running them inside an installed copy of the package will not work.
+
 ### Publishing
 
-`dist/` is gitignored and built at pack time: `prepack` runs `npm run build`, so
-`npm pack` and `npm publish` both compile first and cannot ship a stale build.
-The `files` allow-list ships `dist/` and `README.md` only — no sources, no
-scripts, no fixtures.
+`dist/` is gitignored and built by two lifecycle hooks, because npm picks a
+different one depending on how the package is being installed:
+
+- `prepack` runs on `npm pack` and `npm publish`, so the tarball you inspect
+  locally is compiled the same way the published one is and cannot ship a stale
+  build.
+- `prepare` runs on a git-URL install (`npm i github:Zaida-3dO/whoowes`), which
+  does not fire `prepack`. Without it such an install lands with no `dist/` and
+  no way to build one, so npm skips the `whoowes` bin shim and
+  `npx github:Zaida-3dO/whoowes` fails. npm skips `prepare` for
+  registry-tarball installs, so it costs consumers of the published package
+  nothing. (A `file:`/local-directory dependency is symlinked rather than built,
+  so neither hook runs for it — build the checkout directly instead.)
+
+The `files` allow-list ships `dist/`, `README.md` and `LICENSE` only — no
+sources, no scripts, no fixtures.
 
 ```
 npm pack                    # inspect the tarball first
