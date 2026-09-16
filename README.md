@@ -58,8 +58,10 @@ different one depending on how the package is being installed:
   no way to build one, so npm skips the `whoowes` bin shim and
   `npx github:Zaida-3dO/whoowes` fails. npm skips `prepare` for
   registry-tarball installs, so it costs consumers of the published package
-  nothing. (A `file:`/local-directory dependency is symlinked rather than built,
-  so neither hook runs for it — build the checkout directly instead.)
+  nothing. (A `file:`/local-directory dependency is symlinked into place, and
+  `prepare` still runs against the linked checkout — so it builds `dist/` there,
+  but only if that checkout's devDependencies are already installed. Otherwise
+  the install fails on a missing `tsc`.)
 
 The `files` allow-list ships `dist/`, `README.md` and `LICENSE` only — no
 sources, no scripts, no fixtures.
