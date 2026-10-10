@@ -224,14 +224,16 @@ await test("a change the fold rejects still leaves no trace", async () => {
 
   // Shares that do not allocate the total: rejected before anything is persisted.
   const res = (await client.callTool({
-    name: "add_expense",
+    name: "add_entry",
     arguments: {
+      type: "expense",
       tab: "lagos", description: "bad", amount: "100", currency: "GBP", paid_by: "ope",
       shares: [{ participant: "ope", pct: "30" }, { participant: "timi", pct: "30" }],
     },
   })) as { content: { text: string }[]; isError?: boolean };
 
   assert.equal(res.isError, true, "mis-allocated shares must be refused");
+  assert.match(res.content[0]!.text, /shares sum to/, "refused for the shares, not for a malformed call");
   assert.equal(readLedger(dir).tabs[0]!.events.length, 0, "a refused change must not be written");
   fs.rmSync(dir, { recursive: true, force: true });
 });

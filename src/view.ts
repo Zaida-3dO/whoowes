@@ -586,7 +586,7 @@ export function renderTabList(ledger: Ledger, generatedAt: string): string {
     ${
       ledger.tabs.length === 0
         ? `<div class="empty"><div class="empty-fig">0</div><div class="empty-t">No tabs yet</div>
-           <p class="empty-p">Create one with the <code>create_tab</code> tool.</p></div>`
+           <p class="empty-p">Create one with the <code>tab</code> tool (action create).</p></div>`
         : `<div class="scroll"><table><thead><tr><th>Tab</th><th>Status</th><th>Base currency</th><th class="r">Entries</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>`
     }
   </section>`;
