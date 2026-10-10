@@ -18,7 +18,7 @@ ledger does the arithmetic with `decimal.js`. The model never computes a number.
 - The exchange rate per currency is the **weighted average of your real
   conversions** (total base spent / total foreign received). Adding a conversion
   retroactively revalues every expense in that currency.
-- A **manually declared rate** (`declare_rate`, as foreign units per 1 base unit)
+- A **manually declared rate** (`add_entry` with `type: "rate"`, as foreign units per 1 base unit)
   overrides the conversions average while in force: expenses revalue retroactively
   and later settlements lock at it. Clearing the declaration falls back to the
   average. A declared rate needs no conversions, so a currency you never converted
@@ -212,22 +212,18 @@ mounted volume.
 
 | Tool | Purpose |
 | --- | --- |
-| `create_tab` | New tab with a name and base currency |
-| `add_participant` | Register a person (global, reused across tabs) |
-| `add_expense` | Shared expense; shares by pct (sum 100) or fixed amounts (sum to total) |
-| `add_settlement` | A payment between two people; locks at the current rate |
-| `add_conversion` | A real FX conversion you made; moves the weighted-average rate |
-| `declare_rate` | Manually pin a currency's rate (overrides the average); omit rate to clear |
-| `get_balances` | Net position per participant in the base currency |
-| `get_person` | One person's obligations, payments, and settlements |
-| `list_tabs` | All tabs |
-| `list_events` | The raw event log with **ids** — where you get the `event_id` for the two below |
+| `add_entry` | Record an entry; `type` is `expense` (shares by pct summing to 100, or fixed amounts summing to the total), `settlement` (a payment between two people; locks at the current rate), `conversion` (a real FX conversion; moves the weighted-average rate) or `rate` (manually pin a currency's rate, overriding the average; omit `rate` to clear) |
+| `tab` | `action` is `create` (name + base currency), `add_participant` (global, reused across tabs), `set_status` (close or reopen) or `set_base_currency` (rebase; everything revalues retroactively) |
+| `view` | `what` is `tabs` (all tabs), `balances` (net position per participant), `person` (one person's obligations, payments and settlements) or `events` (the raw log with **ids**, where you get the `event_id` for the two below) |
 | `edit_event` | Correct any event in place by id, patching only the fields you pass |
 | `remove_event` | Delete any event by id (not just the last one) |
-| `set_tab_status` | Close or reopen a tab |
-| `set_base_currency` | Rebase a tab; everything revalues retroactively |
-| `delete_tab` | Permanently delete a tab and its log (needs `confirm: true`) |
 | `undo_last_event` | Remove the most recent event (the cheap common case) |
+| `delete_tab` | Permanently delete a tab and its log (needs `confirm: true`) |
+| `display` | Render a tab as a standalone HTML page and return its path |
+
+`add_entry`, `tab` and `view` take their verb as a required field and refuse, by
+name, any field that does not belong to it. Destructive tools keep their own names.
+See `CHANGELOG.md` for the 0.1 to 0.2 renames.
 
 ### Editing is in place, on purpose
 

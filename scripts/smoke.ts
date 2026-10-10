@@ -211,40 +211,40 @@ const mkTab = (events: TabEvent[]): Tab => ({
   const listed = (await client.listTools()).tools.map((t) => t.name).sort();
   assert.ok(listed.includes("edit_event"), "edit_event registered");
   assert.ok(listed.includes("remove_event"), "remove_event registered");
-  assert.ok(listed.includes("list_events"), "list_events registered");
+  assert.ok(listed.includes("view"), "view registered");
   assert.ok(listed.includes("display"), "display registered");
-  assert.equal(listed.length, 17, `expected 17 tools, got ${listed.length}: ${listed.join(", ")}`);
+  assert.equal(listed.length, 8, `expected 8 tools, got ${listed.length}: ${listed.join(", ")}`);
 
   // Rebuild the GBP/NGN scenario through the real tools.
-  await call("create_tab", { name: "lagos", base_currency: "GBP" });
-  for (const p of ["ope", "timi", "george"]) await call("add_participant", { name: p });
-  await call("add_conversion", {
+  await call("tab", { action: "create", name: "lagos", base_currency: "GBP" });
+  for (const p of ["ope", "timi", "george"]) await call("tab", { action: "add_participant", name: p });
+  await call("add_entry", { type: "conversion",
     tab: "lagos", from_amount: "50", from_currency: "GBP",
     to_amount: "100000", to_currency: "NGN", date: "2026-07-01",
   });
-  await call("add_expense", {
+  await call("add_entry", { type: "expense",
     tab: "lagos", description: "hotel", amount: "200000", currency: "NGN", paid_by: "ope",
     shares: [{ participant: "timi", pct: "20" }, { participant: "george", pct: "80" }],
     date: "2026-07-02",
   });
-  await call("add_settlement", {
+  await call("add_entry", { type: "settlement",
     tab: "lagos", from: "george", to: "ope", amount: "20000", currency: "NGN", date: "2026-07-03",
   });
-  await call("add_conversion", {
+  await call("add_entry", { type: "conversion",
     tab: "lagos", from_amount: "60", from_currency: "GBP",
     to_amount: "150000", to_currency: "NGN", date: "2026-07-04",
   });
 
   // list_events is the id-discovery path the mutations depend on.
-  const log = await call("list_events", { tab: "lagos" });
+  const log = await call("view", { what: "events", tab: "lagos" });
   assert.equal(log.events.length, 4);
   assert.deepEqual(log.events.map((e: any) => e.kind), ["conversion", "expense", "settlement", "conversion"]);
   const [c1, e1, s1, c2] = log.events.map((e: any) => e.id) as string[];
 
   // Baseline matches the fold-level scenario above: settlement locked at £10.
-  const before = await call("get_balances", { tab: "lagos" });
+  const before = await call("view", { what: "balances", tab: "lagos" });
   assert.equal(netOf(before, "ope"), "78.00");
-  assert.equal((await call("get_person", { tab: "lagos", participant: "george" })).settlements_made[0].base_value, "10.00");
+  assert.equal((await call("view", { what: "person", tab: "lagos", participant: "george" })).settlements_made[0].base_value, "10.00");
 
   // ── The position-preserving guarantee ────────────────────────────────────────
   // Edit the FIRST conversion (£50 -> £100 for the same ₦100,000, so its rate becomes
@@ -258,11 +258,11 @@ const mkTab = (events: TabEvent[]): Tab => ({
   assert.equal(edited.after.id, c1, "id is immutable across an edit");
   assert.equal(edited.after.kind, "conversion", "kind is immutable across an edit");
 
-  const george = await call("get_person", { tab: "lagos", participant: "george" });
+  const george = await call("view", { what: "person", tab: "lagos", participant: "george" });
   assert.equal(george.settlements_made[0].base_value, "20.00", "settlement relocked at the edited rate IN ITS OWN POSITION");
 
   // ...and the expense revalued retroactively at the new average (160/250,000 = 0.00064).
-  const after = await call("get_balances", { tab: "lagos" });
+  const after = await call("view", { what: "balances", tab: "lagos" });
   assert.equal(after.rates["NGN"].effective, "0.00064");
   assert.equal(netOf(after, "ope"), "108.00", "paid £128, received £20");
   assert.equal(netOf(after, "george"), "-82.40", "owes £102.40, settled £20");
@@ -273,13 +273,13 @@ const mkTab = (events: TabEvent[]): Tab => ({
   await refused("remove_event", { tab: "lagos", event_id: c1 }, /no rate available for NGN/);
 
   // ...and the refusal left nothing behind: the log and every balance are untouched.
-  const afterRefusal = await call("get_balances", { tab: "lagos" });
+  const afterRefusal = await call("view", { what: "balances", tab: "lagos" });
   assert.deepEqual(afterRefusal, after, "a refused remove must not mutate the tab");
-  assert.equal((await call("list_events", { tab: "lagos" })).events.length, 4, "refused remove kept the log intact");
+  assert.equal((await call("view", { what: "events", tab: "lagos" })).events.length, 4, "refused remove kept the log intact");
 
   // ── Notes are carried on expenses and surface on the person view ─────────────
   await call("edit_event", { tab: "lagos", event_id: e1, note: "provisional — not yet booked" });
-  const noted = await call("get_person", { tab: "lagos", participant: "george" });
+  const noted = await call("view", { what: "person", tab: "lagos", participant: "george" });
   assert.equal(noted.owes[0].note, "provisional — not yet booked");
   assert.equal(noted.owes[0].id, e1, "person view exposes the event id to edit by");
 
@@ -290,7 +290,7 @@ const mkTab = (events: TabEvent[]): Tab => ({
   assert.equal(netOf(rescaled, "george"), "-31.20");
   assert.equal(netOf(rescaled, "timi"), "-12.80");
   await call("edit_event", { tab: "lagos", event_id: e1, amount: "200000" });
-  assert.equal(netOf(await call("get_balances", { tab: "lagos" }), "ope"), "108.00", "restored");
+  assert.equal(netOf(await call("view", { what: "balances", tab: "lagos" }), "ope"), "108.00", "restored");
 
   // Fixed shares stop summing when the total changes -> refused by the shared validator.
   await call("edit_event", {
@@ -308,7 +308,7 @@ const mkTab = (events: TabEvent[]): Tab => ({
   const removed = await call("remove_event", { tab: "lagos", event_id: s1 });
   assert.equal(removed.removed.id, s1);
   assert.equal(removed.removed.kind, "settlement");
-  const logAfter = await call("list_events", { tab: "lagos" });
+  const logAfter = await call("view", { what: "events", tab: "lagos" });
   assert.deepEqual(logAfter.events.map((e: any) => e.id), [c1, e1, c2], "middle event gone, order kept");
   assert.equal(netOf(removed, "george"), "-102.40", "settlement no longer credits george");
 
@@ -354,7 +354,7 @@ const mkTab = (events: TabEvent[]): Tab => ({
     assert.equal(fs.readdirSync(out).length, before, "a refused display writes no file");
 
     // Several tabs -> the list, since there is no longer an obvious one.
-    await call("create_tab", { name: "abuja", base_currency: "NGN" });
+    await call("tab", { action: "create", name: "abuja", base_currency: "NGN" });
     const list = await call("display", {});
     assert.equal(list.rendered, "tab list");
     const listHtml = fs.readFileSync(list.path, "utf8");
@@ -363,9 +363,9 @@ const mkTab = (events: TabEvent[]): Tab => ({
 
     // A closed sole tab is not "obvious" either -> the list, matching /view.
     await call("delete_tab", { tab: "abuja", confirm: true });
-    await call("set_tab_status", { tab: "lagos", status: "closed" });
+    await call("tab", { action: "set_status", tab: "lagos", status: "closed" });
     assert.equal((await call("display", {})).rendered, "tab list", "a closed sole tab still lists");
-    await call("set_tab_status", { tab: "lagos", status: "open" });
+    await call("tab", { action: "set_status", tab: "lagos", status: "open" });
 
     // ── every render gets its own file ────────────────────────────────────────
     // Two reproduced collisions, both of which a slug + one-second timestamp allows:
@@ -388,8 +388,8 @@ const mkTab = (events: TabEvent[]): Tab => ({
     //     real defect: `display` answered rendered:"Team Dinner" while the file on
     //     disk held team-dinner's data. Each response must match its own file.
     {
-      await call("create_tab", { name: "Team Dinner", base_currency: "GBP" });
-      await call("create_tab", { name: "team-dinner", base_currency: "NGN" });
+      await call("tab", { action: "create", name: "Team Dinner", base_currency: "GBP" });
+      await call("tab", { action: "create", name: "team-dinner", base_currency: "NGN" });
 
       const upper = await call("display", { tab: "Team Dinner" });
       const lower = await call("display", { tab: "team-dinner" });

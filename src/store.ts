@@ -179,7 +179,7 @@ export function ensureOpen(tab: Tab): void {
 export function ensureParticipant(ledger: Ledger, name: string): string {
   const n = normalizeName(name);
   if (!ledger.participants.includes(n)) {
-    throw new LedgerError(`unknown participant "${name}". Known: ${ledger.participants.join(", ") || "(none)"}. Use add_participant first.`);
+    throw new LedgerError(`unknown participant "${name}". Known: ${ledger.participants.join(", ") || "(none)"}. Use tab action add_participant first.`);
   }
   return n;
 }

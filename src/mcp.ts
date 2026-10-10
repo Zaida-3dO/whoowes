@@ -66,7 +66,7 @@ function commitEvent(tab: Tab, event: TabEvent, ledgerSave: () => void) {
 
 /**
  * Resolves participants, enforces one share mode, and checks the shares allocate exactly the
- * total. Shared by add_expense and edit_event so an edited expense is held to the same rule —
+ * total. Shared by add_entry (expense) and edit_event so an edited expense is held to the same rule —
  * and re-checked even when only the amount moved, since fixed shares no longer sum to it.
  */
 function normalizeShares(
@@ -225,12 +225,298 @@ function writePage(slug: string, html: string): string {
   return path.resolve(file);
 }
 
+// ===== fold dispatch support ==================================================
+
+type Spec = { required: string[]; optional: string[] };
+
+const ENTRY_SPEC = {
+  expense: { required: ["tab", "description", "amount", "currency", "paid_by", "shares"], optional: ["note", "date"] },
+  settlement: { required: ["tab", "from", "to", "amount", "currency"], optional: ["note", "date"] },
+  conversion: { required: ["tab", "from_amount", "from_currency", "to_amount", "to_currency"], optional: ["note", "date"] },
+  rate: { required: ["tab", "currency"], optional: ["rate", "note", "date"] },
+} satisfies Record<string, Spec>;
+
+const TAB_SPEC = {
+  create: { required: ["name", "base_currency"], optional: [] },
+  add_participant: { required: ["name"], optional: [] },
+  set_status: { required: ["tab", "status"], optional: [] },
+  set_base_currency: { required: ["tab", "base_currency"], optional: [] },
+} satisfies Record<string, Spec>;
+
+const VIEW_SPEC = {
+  tabs: { required: [], optional: [] },
+  balances: { required: ["tab"], optional: [] },
+  person: { required: ["tab", "participant"], optional: [] },
+  events: { required: ["tab"], optional: [] },
+} satisfies Record<string, Spec>;
+
+/**
+ * Refuses, by name, every supplied field that does not belong to the chosen verb, and every
+ * required field that is missing. The schemas are flat and passthrough, so the handler sees
+ * exactly what the caller sent; without this a field meant for a different verb would be
+ * accepted and ignored. Returns the args unchanged.
+ */
+function assertFields(label: string, args: Record<string, unknown>, spec: Spec): Record<string, unknown> {
+  const supplied = Object.keys(args).filter((k) => args[k] !== undefined);
+  const allowed = [...spec.required, ...spec.optional];
+  const foreign = supplied.filter((k) => !allowed.includes(k));
+  if (foreign.length > 0) {
+    throw new LedgerError(
+      `${label} does not take: ${foreign.join(", ")}. It takes: ${allowed.length ? allowed.join(", ") : "(no fields)"}`
+    );
+  }
+  const missing = spec.required.filter((k) => !supplied.includes(k));
+  if (missing.length > 0) {
+    throw new LedgerError(`${label} requires: ${missing.join(", ")}`);
+  }
+  return args;
+}
+
+const today = () => new Date().toISOString().slice(0, 10);
+
+// ----- ops: the bodies of the former per-verb tools, unchanged in behaviour -------------
+
+function opCreateTab({ name, base_currency }: { name: string; base_currency: string }) {
+  return withLedger((ledger) => {
+    if (ledger.tabs.some((t) => normalizeName(t.name) === normalizeName(name))) {
+      throw new LedgerError(`a tab named "${name}" already exists`);
+    }
+    const tab: Tab = {
+      id: randomUUID(),
+      name: name.trim(),
+      base_currency,
+      status: "open",
+      created_at: new Date().toISOString(),
+      events: [],
+    };
+    ledger.tabs.push(tab);
+    save(ledger);
+    return { created: tab.name, base_currency: tab.base_currency };
+  });
+}
+
+function opAddParticipant({ name }: { name: string }) {
+  return withLedger((ledger) => {
+    const n = normalizeName(name);
+    if (!ledger.participants.includes(n)) {
+      ledger.participants.push(n);
+      save(ledger);
+    }
+    return { participants: ledger.participants };
+  });
+}
+
+function opSetTabStatus({ tab: tabName, status }: { tab: string; status: "open" | "closed" }) {
+  return withLedger((ledger) => {
+    const tab = findTab(ledger, tabName);
+    tab.status = status;
+    save(ledger);
+    return { tab: tab.name, status: tab.status };
+  });
+}
+
+function opSetBaseCurrency({ tab: tabName, base_currency }: { tab: string; base_currency: string }) {
+  return withLedger((ledger) => {
+    const tab = findTab(ledger, tabName);
+    const previous = tab.base_currency;
+    if (previous === base_currency) {
+      throw new LedgerError(`tab "${tab.name}" already reports in ${base_currency}`);
+    }
+    // A conversion only carries a rate if one of its sides is the base; otherwise the
+    // fold would silently read the wrong side as the base amount.
+    for (const ev of tab.events) {
+      if (ev.kind === "conversion" && ev.from_currency !== base_currency && ev.to_currency !== base_currency) {
+        throw new LedgerError(
+          `cannot rebase to ${base_currency}: the conversion on ${ev.date} (${ev.from_amount} ${ev.from_currency} -> ${ev.to_amount} ${ev.to_currency}) has no ${base_currency} side. Every conversion must have one side in the base currency.`
+        );
+      }
+    }
+    tab.base_currency = base_currency;
+    try {
+      const fold = foldTab(tab);
+      if (fold.rates.declared.has(base_currency)) {
+        throw new LedgerError(
+          `cannot rebase to ${base_currency}: a rate is declared for it, and a tab cannot hold a rate against its own base. Clear it first (add_entry type "rate" with no rate), then rebase.`
+        );
+      }
+    } catch (e) {
+      tab.base_currency = previous;
+      throw e;
+    }
+    save(ledger);
+    return { rebased_from: previous, ...balancesReport(tab) };
+  });
+}
+
+function opAddExpense(a: {
+  tab: string;
+  description: string;
+  amount: string;
+  currency: string;
+  paid_by: string;
+  shares: { participant: string; pct?: string; amount?: string }[];
+  note?: string;
+  date?: string;
+}) {
+  return withLedger((ledger) => {
+    const tab = findTab(ledger, a.tab);
+    ensureOpen(tab);
+    const payer = ensureParticipant(ledger, a.paid_by);
+    const normalized = normalizeShares(ledger, a.shares, new Decimal(a.amount), a.currency);
+    commitEvent(
+      tab,
+      {
+        kind: "expense",
+        id: randomUUID(),
+        date: a.date ?? today(),
+        description: a.description.trim(),
+        amount: a.amount,
+        currency: a.currency,
+        paid_by: payer,
+        shares: normalized,
+        ...(a.note ? { note: a.note } : {}),
+      },
+      () => save(ledger)
+    );
+    return balancesReport(tab);
+  });
+}
+
+function opAddSettlement(a: {
+  tab: string;
+  from: string;
+  to: string;
+  amount: string;
+  currency: string;
+  note?: string;
+  date?: string;
+}) {
+  return withLedger((ledger) => {
+    const tab = findTab(ledger, a.tab);
+    ensureOpen(tab);
+    const f = ensureParticipant(ledger, a.from);
+    const t = ensureParticipant(ledger, a.to);
+    if (f === t) throw new LedgerError("from and to must be different participants");
+    commitEvent(
+      tab,
+      {
+        kind: "settlement",
+        id: randomUUID(),
+        date: a.date ?? today(),
+        amount: a.amount,
+        currency: a.currency,
+        from: f,
+        to: t,
+        ...(a.note ? { note: a.note } : {}),
+      },
+      () => save(ledger)
+    );
+    return balancesReport(tab);
+  });
+}
+
+function opAddConversion(a: {
+  tab: string;
+  from_amount: string;
+  from_currency: string;
+  to_amount: string;
+  to_currency: string;
+  note?: string;
+  date?: string;
+}) {
+  return withLedger((ledger) => {
+    const tab = findTab(ledger, a.tab);
+    ensureOpen(tab);
+    if (a.from_currency === a.to_currency) throw new LedgerError("from and to currencies must differ");
+    if (a.from_currency !== tab.base_currency && a.to_currency !== tab.base_currency) {
+      throw new LedgerError(`one side of a conversion must be the tab's base currency (${tab.base_currency})`);
+    }
+    commitEvent(
+      tab,
+      {
+        kind: "conversion",
+        id: randomUUID(),
+        date: a.date ?? today(),
+        from_amount: a.from_amount,
+        from_currency: a.from_currency,
+        to_amount: a.to_amount,
+        to_currency: a.to_currency,
+        ...(a.note ? { note: a.note } : {}),
+      },
+      () => save(ledger)
+    );
+    return balancesReport(tab);
+  });
+}
+
+function opDeclareRate(a: { tab: string; currency: string; rate?: string; note?: string; date?: string }) {
+  return withLedger((ledger) => {
+    const tab = findTab(ledger, a.tab);
+    ensureOpen(tab);
+    if (a.currency === tab.base_currency) {
+      throw new LedgerError(`cannot declare a rate for the base currency (${tab.base_currency})`);
+    }
+    commitEvent(
+      tab,
+      {
+        kind: "rate",
+        id: randomUUID(),
+        date: a.date ?? today(),
+        currency: a.currency,
+        ...(a.rate !== undefined ? { foreign_per_base: a.rate } : {}),
+        ...(a.note ? { note: a.note } : {}),
+      },
+      () => save(ledger)
+    );
+    return balancesReport(tab);
+  });
+}
+
+function opViewTabs() {
+  const ledger = load();
+  return {
+    ledger_file: ledgerFilePath(),
+    participants: ledger.participants,
+    tabs: ledger.tabs.map((t) => ({
+      name: t.name,
+      status: t.status,
+      base_currency: t.base_currency,
+      events: t.events.length,
+      created_at: t.created_at,
+    })),
+  };
+}
+
+function opViewBalances({ tab }: { tab: string }) {
+  return balancesReport(findTab(load(), tab));
+}
+
+function opViewPerson({ tab, participant }: { tab: string; participant: string }) {
+  const ledger = load();
+  return personView(findTab(ledger, tab), ensureParticipant(ledger, participant));
+}
+
+function opViewEvents({ tab: tabName }: { tab: string }) {
+  const tab = findTab(load(), tabName);
+  return {
+    tab: tab.name,
+    base_currency: tab.base_currency,
+    events: tab.events.map((ev, i) => ({
+      position: i + 1,
+      id: ev.id,
+      kind: ev.kind,
+      date: ev.date,
+      summary: summarize(ev),
+    })),
+  };
+}
+
 /**
  * Builds a fully-registered server. A factory rather than a singleton because the
  * HTTP transport is stateless: every request gets its own server + transport pair.
  */
 export function createServer(): McpServer {
-  const server = new McpServer({ name: "whoowes", version: "0.1.0" });
+  const server = new McpServer({ name: "whoowes", version: "0.2.0" });
 
   // ===== per-tool-call logging instrument =====================================
   // Wraps McpServer's OWN registration method once, so every existing
@@ -254,7 +540,7 @@ export function createServer(): McpServer {
         const durationMs = Number(process.hrtime.bigint() - t0) / 1e6;
         // error_class only — NEVER e.message: LedgerError messages routinely embed tab
         // names, descriptions, participants and amounts (see the throw sites throughout
-        // this file, e.g. set_base_currency's rebase refusal). See the no-PII contract
+        // this file, e.g. the tab set_base_currency rebase refusal). See the no-PII contract
         // above logToolCall.
         logToolCall(name, durationMs, false, e instanceof Error ? e.constructor.name : "Error");
         throw e; // re-throw unchanged — existing MCP error handling is untouched
@@ -264,278 +550,132 @@ export function createServer(): McpServer {
   }) as typeof server.registerTool;
   // ===== end logging instrument =================================================
 
+  // ===== folded tools ==========================================================
+  // Three tools replace twelve (see CHANGELOG 0.2.0). Each takes its verb as a required
+  // enum field and dispatches to the same op the old tool ran, so the event log written to
+  // ledger.json is identical. The schema is deliberately flat (one object, every field
+  // optional) with .passthrough(): zod would otherwise strip unknown keys before the
+  // handler runs and a misplaced field would vanish silently. assertFields() then refuses,
+  // by name, anything that does not belong to the chosen verb.
+
+  const shareSchema = z.array(
+    z.object({ participant: z.string(), pct: money.optional(), amount: money.optional() })
+  );
+
   server.registerTool(
-    "create_tab",
+    "add_entry",
     {
       description:
-        "Create a new tab (a self-contained event or trip ledger). All balances are reported in its base currency.",
-      inputSchema: {
-        name: z.string().trim().min(1),
-        base_currency: currency,
-      },
-    },
-    async ({ name, base_currency }) =>
-      run(() =>
-        withLedger((ledger) => {
-          if (ledger.tabs.some((t) => normalizeName(t.name) === normalizeName(name))) {
-            throw new LedgerError(`a tab named "${name}" already exists`);
-          }
-          const tab: Tab = {
-            id: randomUUID(),
-            name: name.trim(),
-            base_currency,
-            status: "open",
-            created_at: new Date().toISOString(),
-            events: [],
-          };
-          ledger.tabs.push(tab);
-          save(ledger);
-          return { created: tab.name, base_currency: tab.base_currency };
+        "Record an entry on a tab. type picks the kind and which fields apply. " +
+        "expense: tab, description, amount, currency, paid_by, shares (all pct summing to 100, or all fixed amounts summing to the total; include the payer's own share if they consumed part of it), optional note, date. " +
+        "settlement: tab, from, to, amount, currency, optional note, date; a payment between two people, locked at the tab's cumulative rate when recorded, so a conversion for that currency must exist first. " +
+        "conversion: tab, from_amount, from_currency, to_amount, to_currency, optional note, date; a real currency conversion, one side must be the base currency; the tab's rate is the weighted average of all conversions and revalues every expense in that currency. " +
+        "rate: tab, currency, optional rate, note, date; manually declare units of currency per 1 base unit, overriding the conversions average; omit rate to clear the declaration. " +
+        "Use note for context that is not the description. Fields that do not belong to the chosen type are refused by name.",
+      inputSchema: z
+        .object({
+          type: z.enum(["expense", "settlement", "conversion", "rate"]),
+          tab: z.string().optional(),
+          description: z.string().trim().min(1).optional(),
+          amount: money.optional(),
+          currency: currency.optional(),
+          paid_by: z.string().optional(),
+          shares: shareSchema.min(1).optional(),
+          from: z.string().optional(),
+          to: z.string().optional(),
+          from_amount: money.optional(),
+          from_currency: currency.optional(),
+          to_amount: money.optional(),
+          to_currency: currency.optional(),
+          rate: money.optional(),
+          note: z.string().optional(),
+          date: isoDate,
         })
-      )
-  );
-
-  server.registerTool(
-    "add_participant",
-    {
-      description: "Register a participant. Participants are global and reusable across tabs.",
-      inputSchema: { name: z.string().trim().min(1) },
+        .passthrough(),
     },
-    async ({ name }) =>
-      run(() =>
-        withLedger((ledger) => {
-          const n = normalizeName(name);
-          if (!ledger.participants.includes(n)) {
-            ledger.participants.push(n);
-            save(ledger);
-          }
-          return { participants: ledger.participants };
-        })
-      )
-  );
-
-  server.registerTool(
-    "add_expense",
-    {
-      description:
-        "Record a shared expense on a tab. Shares allocate the full expense: all pct (summing to 100) or all fixed amounts (summing to the total). Include the payer's own share if they consumed part of it (e.g. '20% timi, 80% george' means the payer consumed nothing). Use note for context that isn't the description: what's provisional, why it's split this way, what it assumes.",
-      inputSchema: {
-        tab: z.string(),
-        description: z.string().trim().min(1),
-        amount: money,
-        currency: currency,
-        paid_by: z.string(),
-        shares: z
-          .array(
-            z.object({
-              participant: z.string(),
-              pct: money.optional(),
-              amount: money.optional(),
-            })
-          )
-          .min(1),
-        note: z.string().optional(),
-        date: isoDate,
-      },
-    },
-    async ({ tab: tabName, description, amount, currency: ccy, paid_by, shares, note, date }) =>
-      run(() =>
-        withLedger((ledger) => {
-          const tab = findTab(ledger, tabName);
-          ensureOpen(tab);
-          const payer = ensureParticipant(ledger, paid_by);
-
-          const normalized = normalizeShares(ledger, shares, new Decimal(amount), ccy);
-
-          commitEvent(
-            tab,
-            {
-              kind: "expense",
-              id: randomUUID(),
-              date: date ?? new Date().toISOString().slice(0, 10),
-              description: description.trim(),
-              amount,
-              currency: ccy,
-              paid_by: payer,
-              shares: normalized,
-              ...(note ? { note } : {}),
-            },
-            () => save(ledger)
-          );
-          return balancesReport(tab);
-        })
-      )
-  );
-
-  server.registerTool(
-    "add_settlement",
-    {
-      description:
-        "Record a payment from one participant to another (e.g. 'george transferred me 20k naira'). Its base-currency value locks at the tab's cumulative exchange rate at the moment it is recorded; a conversion for that currency must already exist.",
-      inputSchema: {
-        tab: z.string(),
-        from: z.string(),
-        to: z.string(),
-        amount: money,
-        currency: currency,
-        note: z.string().optional(),
-        date: isoDate,
-      },
-    },
-    async ({ tab: tabName, from, to, amount, currency: ccy, note, date }) =>
-      run(() =>
-        withLedger((ledger) => {
-          const tab = findTab(ledger, tabName);
-          ensureOpen(tab);
-          const f = ensureParticipant(ledger, from);
-          const t = ensureParticipant(ledger, to);
-          if (f === t) throw new LedgerError("from and to must be different participants");
-
-          commitEvent(
-            tab,
-            {
-              kind: "settlement",
-              id: randomUUID(),
-              date: date ?? new Date().toISOString().slice(0, 10),
-              amount,
-              currency: ccy,
-              from: f,
-              to: t,
-              ...(note ? { note } : {}),
-            },
-            () => save(ledger)
-          );
-          return balancesReport(tab);
-        })
-      )
-  );
-
-  server.registerTool(
-    "add_conversion",
-    {
-      description:
-        "Record a real currency conversion you made (what you gave and what you received). One side must be the tab's base currency. The tab's cumulative rate is the weighted average over all conversions, and it retroactively revalues every expense in that currency.",
-      inputSchema: {
-        tab: z.string(),
-        from_amount: money,
-        from_currency: currency,
-        to_amount: money,
-        to_currency: currency,
-        note: z.string().optional(),
-        date: isoDate,
-      },
-    },
-    async ({ tab: tabName, from_amount, from_currency, to_amount, to_currency, note, date }) =>
-      run(() =>
-        withLedger((ledger) => {
-          const tab = findTab(ledger, tabName);
-          ensureOpen(tab);
-          if (from_currency === to_currency) throw new LedgerError("from and to currencies must differ");
-          if (from_currency !== tab.base_currency && to_currency !== tab.base_currency) {
-            throw new LedgerError(`one side of a conversion must be the tab's base currency (${tab.base_currency})`);
-          }
-
-          commitEvent(
-            tab,
-            {
-              kind: "conversion",
-              id: randomUUID(),
-              date: date ?? new Date().toISOString().slice(0, 10),
-              from_amount,
-              from_currency,
-              to_amount,
-              to_currency,
-              ...(note ? { note } : {}),
-            },
-            () => save(ledger)
-          );
-          return balancesReport(tab);
-        })
-      )
-  );
-
-  server.registerTool(
-    "declare_rate",
-    {
-      description:
-        "Manually declare the exchange rate for a currency on a tab, as units of that currency per 1 unit of the base currency (e.g. currency NGN, rate 2000 means 2000 NGN = 1 GBP). While declared, it overrides the conversions average everywhere: expenses revalue retroactively, and settlements recorded afterwards lock at it. Declare again to change it; omit rate to clear the declaration and fall back to the conversions average.",
-      inputSchema: {
-        tab: z.string(),
-        currency: currency,
-        rate: money.optional(),
-        note: z.string().optional(),
-        date: isoDate,
-      },
-    },
-    async ({ tab: tabName, currency: ccy, rate, note, date }) =>
-      run(() =>
-        withLedger((ledger) => {
-          const tab = findTab(ledger, tabName);
-          ensureOpen(tab);
-          if (ccy === tab.base_currency) {
-            throw new LedgerError(`cannot declare a rate for the base currency (${tab.base_currency})`);
-          }
-          commitEvent(
-            tab,
-            {
-              kind: "rate",
-              id: randomUUID(),
-              date: date ?? new Date().toISOString().slice(0, 10),
-              currency: ccy,
-              ...(rate !== undefined ? { foreign_per_base: rate } : {}),
-              ...(note ? { note } : {}),
-            },
-            () => save(ledger)
-          );
-          return balancesReport(tab);
-        })
-      )
-  );
-
-  server.registerTool(
-    "get_balances",
-    {
-      description:
-        "Current state of a tab: per-participant net position in the base currency, cumulative exchange rates, and any amounts that cannot be valued yet.",
-      inputSchema: { tab: z.string() },
-    },
-    async ({ tab: tabName }) => run(() => balancesReport(findTab(load(), tabName)))
-  );
-
-  server.registerTool(
-    "get_person",
-    {
-      description:
-        "Everything about one participant on a tab: what they were meant to pay (their expense shares), what they paid for, and settlements made/received, plus their net position.",
-      inputSchema: { tab: z.string(), participant: z.string() },
-    },
-    async ({ tab: tabName, participant }) =>
+    async ({ type, ...args }) =>
       run(() => {
-        const ledger = load();
-        return personView(findTab(ledger, tabName), ensureParticipant(ledger, participant));
+        const a = assertFields(`add_entry type "${type}"`, args, ENTRY_SPEC[type]) as any;
+        switch (type) {
+          case "expense":
+            return opAddExpense(a);
+          case "settlement":
+            return opAddSettlement(a);
+          case "conversion":
+            return opAddConversion(a);
+          case "rate":
+            return opDeclareRate(a);
+        }
       })
   );
 
   server.registerTool(
-    "list_tabs",
+    "tab",
     {
-      description: "List all tabs with status, base currency, and event count.",
-      inputSchema: {},
+      description:
+        "Manage tabs and participants. action picks the operation and which fields apply. " +
+        "create: name, base_currency; a new tab (a self-contained event or trip ledger); balances are reported in its base currency. " +
+        "add_participant: name; participants are global and reusable across tabs. " +
+        "set_status: tab, status (open|closed); a closed tab accepts no further events. " +
+        "set_base_currency: tab, base_currency; everything revalues retroactively and conversions re-read themselves from the new side; refused if any conversion has no side in the new base, or a rate is declared for it. " +
+        "Fields that do not belong to the chosen action are refused by name.",
+      inputSchema: z
+        .object({
+          action: z.enum(["create", "add_participant", "set_status", "set_base_currency"]),
+          name: z.string().trim().min(1).optional(),
+          tab: z.string().optional(),
+          base_currency: currency.optional(),
+          status: z.enum(["open", "closed"]).optional(),
+        })
+        .passthrough(),
     },
-    async () =>
+    async ({ action, ...args }) =>
       run(() => {
-        const ledger = load();
-        return {
-          ledger_file: ledgerFilePath(),
-          participants: ledger.participants,
-          tabs: ledger.tabs.map((t) => ({
-            name: t.name,
-            status: t.status,
-            base_currency: t.base_currency,
-            events: t.events.length,
-            created_at: t.created_at,
-          })),
-        };
+        const a = assertFields(`tab action "${action}"`, args, TAB_SPEC[action]) as any;
+        switch (action) {
+          case "create":
+            return opCreateTab(a);
+          case "add_participant":
+            return opAddParticipant(a);
+          case "set_status":
+            return opSetTabStatus(a);
+          case "set_base_currency":
+            return opSetBaseCurrency(a);
+        }
+      })
+  );
+
+  server.registerTool(
+    "view",
+    {
+      description:
+        "Read ledger state. what picks the view and which fields apply. " +
+        "tabs: no fields; every tab with status, base currency and event count, plus the participants. " +
+        "balances: tab; per-participant net position in the base currency, cumulative exchange rates, and amounts that cannot be valued yet. " +
+        "person: tab, participant; what they were meant to pay, what they paid for, settlements made and received, and their net position. " +
+        "events: tab; the raw event log in order with each event's id and a one-line summary; this is where edit_event and remove_event get their event_id. " +
+        "Fields that do not belong to the chosen view are refused by name.",
+      inputSchema: z
+        .object({
+          what: z.enum(["tabs", "balances", "person", "events"]),
+          tab: z.string().optional(),
+          participant: z.string().optional(),
+        })
+        .passthrough(),
+    },
+    async ({ what, ...args }) =>
+      run(() => {
+        const a = assertFields(`view what "${what}"`, args, VIEW_SPEC[what]) as any;
+        switch (what) {
+          case "tabs":
+            return opViewTabs();
+          case "balances":
+            return opViewBalances(a);
+          case "person":
+            return opViewPerson(a);
+          case "events":
+            return opViewEvents(a);
+        }
       })
   );
 
@@ -586,65 +726,6 @@ export function createServer(): McpServer {
   );
 
   server.registerTool(
-    "set_tab_status",
-    {
-      description: "Close a tab (no further events) or reopen it.",
-      inputSchema: { tab: z.string(), status: z.enum(["open", "closed"]) },
-    },
-    async ({ tab: tabName, status }) =>
-      run(() =>
-        withLedger((ledger) => {
-          const tab = findTab(ledger, tabName);
-          tab.status = status;
-          save(ledger);
-          return { tab: tab.name, status: tab.status };
-        })
-      )
-  );
-
-  server.registerTool(
-    "set_base_currency",
-    {
-      description:
-        "Change the currency a tab reports balances in. Everything revalues retroactively, and conversions re-read themselves from the new side (a GBP->NGN conversion means 'NGN per GBP' or 'GBP per NGN' depending on the base). Refused if any conversion has no side in the new base, or if a rate is declared for it.",
-      inputSchema: { tab: z.string(), base_currency: currency },
-    },
-    async ({ tab: tabName, base_currency }) =>
-      run(() =>
-        withLedger((ledger) => {
-          const tab = findTab(ledger, tabName);
-          const previous = tab.base_currency;
-          if (previous === base_currency) {
-            throw new LedgerError(`tab "${tab.name}" already reports in ${base_currency}`);
-          }
-          // A conversion only carries a rate if one of its sides is the base; otherwise the
-          // fold would silently read the wrong side as the base amount.
-          for (const ev of tab.events) {
-            if (ev.kind === "conversion" && ev.from_currency !== base_currency && ev.to_currency !== base_currency) {
-              throw new LedgerError(
-                `cannot rebase to ${base_currency}: the conversion on ${ev.date} (${ev.from_amount} ${ev.from_currency} -> ${ev.to_amount} ${ev.to_currency}) has no ${base_currency} side. Every conversion must have one side in the base currency.`
-              );
-            }
-          }
-          tab.base_currency = base_currency;
-          try {
-            const fold = foldTab(tab);
-            if (fold.rates.declared.has(base_currency)) {
-              throw new LedgerError(
-                `cannot rebase to ${base_currency}: a rate is declared for it, and a tab cannot hold a rate against its own base. Clear it first (declare_rate with no rate), then rebase.`
-              );
-            }
-          } catch (e) {
-            tab.base_currency = previous;
-            throw e;
-          }
-          save(ledger);
-          return { rebased_from: previous, ...balancesReport(tab) };
-        })
-      )
-  );
-
-  server.registerTool(
     "delete_tab",
     {
       description:
@@ -672,34 +753,10 @@ export function createServer(): McpServer {
   );
 
   server.registerTool(
-    "list_events",
-    {
-      description:
-        "The tab's raw event log in order, with each event's id and a one-line summary. This is where you get the event_id that edit_event and remove_event need.",
-      inputSchema: { tab: z.string() },
-    },
-    async ({ tab: tabName }) =>
-      run(() => {
-        const tab = findTab(load(), tabName);
-        return {
-          tab: tab.name,
-          base_currency: tab.base_currency,
-          events: tab.events.map((ev, i) => ({
-            position: i + 1,
-            id: ev.id,
-            kind: ev.kind,
-            date: ev.date,
-            summary: summarize(ev),
-          })),
-        };
-      })
-  );
-
-  server.registerTool(
     "edit_event",
     {
       description:
-        "Correct an event that was recorded wrongly, patching only the fields you pass and leaving it where it is in the log. Use list_events to find the event id. Everything downstream revalues, but the event keeps its position, so settlements still lock at the rate that was in force when they happened. Editable fields depend on the event: expense (description, amount, currency, paid_by, shares), settlement (amount, currency, from, to), conversion (from_amount, from_currency, to_amount, to_currency), rate (currency, rate); every kind also takes date and note. To turn a rate declaration into a clearing, remove_event it instead.",
+        "Correct a recorded event in place by id, patching only the fields you pass; it keeps its position, so settlements keep the rate in force when they happened. Get ids from view what=events. Editable per kind: expense (description, amount, currency, paid_by, shares), settlement (amount, currency, from, to), conversion (from_amount, from_currency, to_amount, to_currency), rate (currency, rate); all kinds also take date and note. To clear a declared rate, remove_event it.",
       inputSchema: {
         tab: z.string(),
         event_id: z.string(),
@@ -824,7 +881,7 @@ export function createServer(): McpServer {
     "remove_event",
     {
       description:
-        "Delete any event from a tab by id, not just the most recent one. Refused if the rest of the log then cannot be valued — e.g. removing a conversion that a later settlement locked its rate against. Use get_balances or list_tabs to find the event id.",
+        "Delete any event from a tab by id, not just the most recent one. Refused if the rest of the log then cannot be valued — e.g. removing a conversion that a later settlement locked its rate against. Use view what=events to find the event id.",
       inputSchema: { tab: z.string(), event_id: z.string() },
     },
     async ({ tab: tabName, event_id }) =>
